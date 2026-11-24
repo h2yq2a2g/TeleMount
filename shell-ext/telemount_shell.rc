@@ -1,0 +1,9 @@
+#define IDI_OVERLAY_PINNED  101
+#define IDI_OVERLAY_CACHED  102
+#define IDI_OVERLAY_CLOUD   103
+#define IDI_OVERLAY_SYNCING 104
+
+IDI_OVERLAY_PINNED  ICON "icons/pinned.ico"
+IDI_OVERLAY_CACHED  ICON "icons/cached.ico"
+IDI_OVERLAY_CLOUD   ICON "icons/cloud.ico"
+IDI_OVERLAY_SYNCING ICON "icons/syncing.ico"

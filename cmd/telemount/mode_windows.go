@@ -184,6 +184,15 @@ func runPlatform(
 	ipcToken := generateIPCToken()
 	srv.SetDesktopIPCToken(ipcToken)
 
+	overlaySrv, oerr := desktop.StartOverlayServer(func(vp string) byte {
+		return byte(cache.OverlayState(vp))
+	})
+	if oerr != nil {
+		log.Printf("shell overlay server warning: %v", oerr)
+	} else {
+		cache.SetOnChange(overlaySrv.NotifyPaths)
+	}
+
 	rt := &desktopRuntime{
 		appCancel:    appCancel,
 		dataDir:      dataDir,
@@ -196,6 +205,7 @@ func runPlatform(
 		probe:        probe,
 		driveChecker: driveChecker,
 		startupMgr:   startupMgr,
+		overlaySrv:   overlaySrv,
 		engine:       engine,
 		tgMgr:        tgMgr,
 		httpSrv:      httpSrv,
@@ -310,6 +320,7 @@ type desktopRuntime struct {
 	probe        desktop.WinFspProbe
 	driveChecker desktop.DriveChecker
 	startupMgr   *desktop.StartupManager
+	overlaySrv   *desktop.OverlayServer
 	engine       *storage.Engine
 	tgMgr        *tg.Manager
 	httpSrv      *http.Server
@@ -397,6 +408,7 @@ func (r *desktopRuntime) Status() web.DesktopStatus {
 		WinFspInstalled:      wf.Installed,
 		WinFspGuidance:       wf.Guidance,
 		DriveLetter:          drive,
+		AvailableDrives:      desktop.ListAvailableDrives(r.driveChecker, drive),
 		Mounted:              mounted,
 		MountError:           mountErr,
 		RunAtStartup:         runAtStartup,
@@ -495,10 +507,12 @@ func (r *desktopRuntime) UpdateSettings(u web.DesktopSettingsUpdate) (web.Deskto
 	if u.DriveLetter != nil && updated.DriveLetter != oldCfg.DriveLetter {
 		r.syncShellIntegration(updated.DriveLetter)
 		if wasMounted {
+			r.overlaySrv.SetDrive("")
 			_ = r.mountMgr.Unmount(context.Background())
 			if err := r.mountMgr.Mount(updated.DriveLetter); err != nil {
 				return r.Status(), err
 			}
+			r.overlaySrv.SetDrive(updated.DriveLetter)
 		}
 	}
 
@@ -639,11 +653,15 @@ func fmtHumanBytes(b int64) string {
 func (r *desktopRuntime) Mount() error {
 	drv := r.cfgStore.Get().DriveLetter
 	err := r.mountMgr.Mount(drv)
+	if err == nil {
+		r.overlaySrv.SetDrive(drv)
+	}
 	r.refreshTray()
 	return err
 }
 
 func (r *desktopRuntime) Unmount() error {
+	r.overlaySrv.SetDrive("")
 	err := r.mountMgr.Unmount(context.Background())
 	r.refreshTray()
 	return err
@@ -807,6 +825,7 @@ func (r *desktopRuntime) ApplyUpdate(ctx context.Context) error {
 	// Safely unmount and flush pending writes BEFORE launching the silent upgrade installer.
 	wasMounted, prevDrive, _ := r.mountMgr.Status()
 	flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	r.overlaySrv.SetDrive("")
 	_ = r.mountMgr.Unmount(flushCtx)
 	if r.engine.IsReady() {
 		_ = r.cache.FlushQueue(flushCtx)
@@ -817,7 +836,9 @@ func (r *desktopRuntime) ApplyUpdate(ctx context.Context) error {
 	if err := desktop.LaunchElevatedInstaller(installerPath); err != nil {
 		// If user declined UAC or launch failed, restore mount cleanly instead of quitting.
 		if wasMounted && prevDrive != "" {
-			_ = r.mountMgr.Mount(prevDrive)
+			if r.mountMgr.Mount(prevDrive) == nil {
+				r.overlaySrv.SetDrive(prevDrive)
+			}
 		}
 		r.refreshTray()
 		return err
@@ -873,6 +894,7 @@ func (r *desktopRuntime) shutdownOnce() {
 	r.quitOnce.Do(func() {
 		log.Println("shutting down TeleMount desktop (unmounting drive and flushing pending writes)...")
 		_ = os.Remove(desktopIPCFilePath(r.dataDir))
+		_ = r.overlaySrv.Close()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		_ = r.mountMgr.Unmount(shutCtx)

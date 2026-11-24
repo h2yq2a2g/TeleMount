@@ -75,6 +75,11 @@ type Manager struct {
 	closed      bool
 	closeCh     chan struct{}
 	syncWg      sync.WaitGroup
+
+	onChangeMu   sync.RWMutex
+	onChange     func(paths ...string)
+	pinSyncingMu sync.Mutex
+	pinSyncing   map[string]int
 }
 
 // Open initializes a persistent disk cache and offline write queue using store and engine.
@@ -114,6 +119,7 @@ func OpenWithBackend(cacheDir, dbPath string, maxBytes int64, store *db.Store, b
 		activeBlobReaders:   make(map[string]int),
 		deferredBlobDeletes: make(map[string]bool),
 		closeCh:             make(chan struct{}),
+		pinSyncing:          make(map[string]int),
 	}
 
 	// Seed strictly monotonic lastAccessNS from DB.
@@ -152,6 +158,55 @@ func OpenWithBackend(cacheDir, dbPath string, maxBytes int64, store *db.Store, b
 	}
 
 	return m, nil
+}
+
+// SetOnChange registers a callback invoked after local cache, pin, or dirty state transitions.
+// Passing nil clears the callback. The callback is always called without holding stateMu.
+func (m *Manager) SetOnChange(fn func(paths ...string)) {
+	m.onChangeMu.Lock()
+	m.onChange = fn
+	m.onChangeMu.Unlock()
+}
+
+func (m *Manager) notifyChange(paths ...string) {
+	m.onChangeMu.RLock()
+	fn := m.onChange
+	m.onChangeMu.RUnlock()
+	if fn != nil {
+		fn(paths...)
+	}
+}
+
+func (m *Manager) beginPinSync(normPath string) {
+	key := strings.ToLower(NormalizePath(normPath))
+	m.pinSyncingMu.Lock()
+	m.pinSyncing[key]++
+	m.pinSyncingMu.Unlock()
+	m.notifyChange(normPath)
+}
+
+func (m *Manager) endPinSync(normPath string) {
+	key := strings.ToLower(NormalizePath(normPath))
+	m.pinSyncingMu.Lock()
+	if n := m.pinSyncing[key]; n <= 1 {
+		delete(m.pinSyncing, key)
+	} else {
+		m.pinSyncing[key] = n - 1
+	}
+	m.pinSyncingMu.Unlock()
+	m.notifyChange(normPath)
+}
+
+func (m *Manager) isPinSyncing(normPath string) bool {
+	lt := strings.ToLower(NormalizePath(normPath))
+	m.pinSyncingMu.Lock()
+	defer m.pinSyncingMu.Unlock()
+	for k := range m.pinSyncing {
+		if k == "/" || lt == k || strings.HasPrefix(lt, k+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // Close stops background sync loops and closes desktop_cache.db cleanly.
@@ -768,6 +823,7 @@ func (m *Manager) downloadAndCommitClean(ctx context.Context, normPath string) (
 	if oldBlobKey != "" && oldBlobKey != blobKey {
 		m.scheduleBlobDeletes([]string{oldBlobKey})
 	}
+	m.notifyChange(canonicalPath)
 	if ce == nil {
 		ce = &cacheEntry{
 			Path:           canonicalPath,
@@ -798,6 +854,8 @@ func (m *Manager) PinSync(ctx context.Context, p string) error {
 	if !found {
 		return os.ErrNotExist
 	}
+	m.beginPinSync(ov.Path)
+	defer m.endPinSync(ov.Path)
 	if !ov.IsDir {
 		if ov.Dirty {
 			return nil

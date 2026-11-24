@@ -67,10 +67,13 @@ func (m *Manager) SetMaxBytes(maxBytes int64) error {
 		return errors.New("maxBytes must be >= 0")
 	}
 	m.stateMu.Lock()
-	defer m.stateMu.Unlock()
-
 	m.maxBytes = maxBytes
-	return m.evictToBudgetLocked()
+	err := m.evictToBudgetLocked()
+	m.stateMu.Unlock()
+	if err == nil {
+		m.notifyChange("/")
+	}
+	return err
 }
 
 // SetPinnedPaths replaces the pinned paths set, recomputes entry pin flags, and evicts if over budget.
@@ -91,15 +94,15 @@ func (m *Manager) SetPinnedPaths(paths []string) error {
 	}
 
 	m.stateMu.Lock()
-	defer m.stateMu.Unlock()
-
 	tx, err := m.db.Begin()
 	if err != nil {
+		m.stateMu.Unlock()
 		return err
 	}
 	defer tx.Rollback()
 
 	if _, err := tx.Exec(`DELETE FROM pinned_paths`); err != nil {
+		m.stateMu.Unlock()
 		return err
 	}
 	now := time.Now().Unix()
@@ -108,12 +111,14 @@ func (m *Manager) SetPinnedPaths(paths []string) error {
 			`INSERT INTO pinned_paths (path_lower, path, created_at) VALUES (?, ?, ?)`,
 			strings.ToLower(p), p, now,
 		); err != nil {
+			m.stateMu.Unlock()
 			return err
 		}
 	}
 
 	rows, err := tx.Query(`SELECT path_lower, path, pinned FROM cache_entries`)
 	if err != nil {
+		m.stateMu.Unlock()
 		return err
 	}
 	type pinUpdate struct {
@@ -126,6 +131,7 @@ func (m *Manager) SetPinnedPaths(paths []string) error {
 		var curPinned int
 		if err := rows.Scan(&pLower, &p, &curPinned); err != nil {
 			_ = rows.Close()
+			m.stateMu.Unlock()
 			return err
 		}
 		want := boolToInt(IsPathPinned(normalized, p))
@@ -134,20 +140,29 @@ func (m *Manager) SetPinnedPaths(paths []string) error {
 		}
 	}
 	if err := rows.Close(); err != nil {
+		m.stateMu.Unlock()
 		return err
 	}
 	for _, u := range updates {
 		if _, err := tx.Exec(`UPDATE cache_entries SET pinned = ? WHERE path_lower = ?`, u.pinned, u.pathLower); err != nil {
+			m.stateMu.Unlock()
 			return err
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
+		m.stateMu.Unlock()
 		return err
 	}
 
 	m.pinnedPaths = normalized
-	return m.evictToBudgetLocked()
+	evErr := m.evictToBudgetLocked()
+	m.stateMu.Unlock()
+	if evErr != nil {
+		return evErr
+	}
+	m.notifyChange("/")
+	return nil
 }
 
 // PinnedPaths returns a copy of the configured pinned virtual paths.
@@ -236,10 +251,9 @@ func (m *Manager) evictToBudgetLocked() error {
 // ClearUnpinned removes all clean, unpinned entries from the disk cache while preserving pinned and dirty entries.
 func (m *Manager) ClearUnpinned() error {
 	m.stateMu.Lock()
-	defer m.stateMu.Unlock()
-
 	rows, err := m.db.Query(`SELECT path_lower, blob_key FROM cache_entries WHERE dirty = 0 AND pinned = 0`)
 	if err != nil {
+		m.stateMu.Unlock()
 		return err
 	}
 	var keys []string
@@ -248,6 +262,7 @@ func (m *Manager) ClearUnpinned() error {
 		var pLower, bKey string
 		if err := rows.Scan(&pLower, &bKey); err != nil {
 			_ = rows.Close()
+			m.stateMu.Unlock()
 			return err
 		}
 		paths = append(paths, pLower)
@@ -256,26 +271,118 @@ func (m *Manager) ClearUnpinned() error {
 		}
 	}
 	if err := rows.Close(); err != nil {
+		m.stateMu.Unlock()
 		return err
 	}
 	if len(paths) == 0 {
+		m.stateMu.Unlock()
 		return nil
 	}
 
 	tx, err := m.db.Begin()
 	if err != nil {
+		m.stateMu.Unlock()
 		return err
 	}
 	defer tx.Rollback()
 
 	if _, err := tx.Exec(`DELETE FROM cache_entries WHERE dirty = 0 AND pinned = 0`); err != nil {
+		m.stateMu.Unlock()
 		return err
 	}
 	if err := tx.Commit(); err != nil {
+		m.stateMu.Unlock()
 		return err
 	}
+	m.stateMu.Unlock()
 	m.scheduleBlobDeletes(keys)
+	m.notifyChange("/")
 	return nil
+}
+
+// OverlayState represents the OneDrive-style Explorer sync/offline icon overlay for a virtual path.
+type OverlayState byte
+
+const (
+	OverlayNone    OverlayState = 'N' // drive root "/" or non-existent path
+	OverlayPinned  OverlayState = 'P' // always keep offline on device (solid green checkmark)
+	OverlayCached  OverlayState = 'C' // available offline in local disk cache (hollow green checkmark)
+	OverlayCloud   OverlayState = 'O' // online-only on Telegram Cloud (blue cloud)
+	OverlaySyncing OverlayState = 'S' // pending upload / dirty write / pinned file still downloading
+)
+
+// OverlayState returns the OneDrive-style status icon state for a file or folder path.
+func (m *Manager) OverlayState(virtualPath string) OverlayState {
+	norm := NormalizePath(virtualPath)
+	if norm == "/" {
+		return OverlayNone
+	}
+
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
+	ov, found, err := m.statLocked(norm)
+	if err != nil || !found {
+		return OverlayNone
+	}
+	pathLower := strings.ToLower(ov.Path)
+	pinned := m.isPinnedLocked(ov.Path)
+
+	if !ov.IsDir {
+		if ov.Dirty {
+			return OverlaySyncing
+		}
+		ce, ceOk, _ := m.getCacheEntry(pathLower)
+		if ceOk && ce.Dirty {
+			return OverlaySyncing
+		}
+		cached := ceOk && !ce.Dirty && m.blobValid(ce.BlobKey, ce.Size)
+		if pinned {
+			if cached {
+				return OverlayPinned
+			}
+			return OverlaySyncing
+		}
+		if cached {
+			return OverlayCached
+		}
+		return OverlayCloud
+	}
+
+	if ov.Dirty {
+		return OverlaySyncing
+	}
+	pStart, pEnd := subtreeBounds(pathLower)
+	var dirtyOverlay int
+	_ = m.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM overlay_nodes WHERE dirty = 1 AND deleted = 0 AND path_lower >= ? AND path_lower < ?)`,
+		pStart, pEnd,
+	).Scan(&dirtyOverlay)
+	if dirtyOverlay != 0 {
+		return OverlaySyncing
+	}
+
+	var cachedCnt, dirtyCnt sql.NullInt64
+	_ = m.db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(CASE WHEN dirty = 1 THEN 1 ELSE 0 END), 0)
+		FROM cache_entries
+		WHERE path_lower >= ? AND path_lower < ?
+	`, pStart, pEnd).Scan(&cachedCnt, &dirtyCnt)
+	if dirtyCnt.Int64 > 0 || m.isPinSyncing(ov.Path) {
+		return OverlaySyncing
+	}
+	if pinned {
+		return OverlayPinned
+	}
+	if cachedCnt.Int64 > 0 {
+		return OverlayCached
+	}
+	for _, pin := range m.pinnedPaths {
+		if strings.HasPrefix(strings.ToLower(pin), pathLower+"/") {
+			return OverlayCached
+		}
+	}
+	return OverlayCloud
 }
 
 // PathCacheStatus summarizes local disk cache and pin state for a file or folder subtree.
@@ -330,8 +437,6 @@ func (m *Manager) EvictPath(virtualPath string) (freedBytes int64, evictedFiles 
 	pathLower := strings.ToLower(norm)
 
 	m.stateMu.Lock()
-	defer m.stateMu.Unlock()
-
 	var rows *sql.Rows
 	if norm == "/" {
 		rows, err = m.db.Query(`SELECT path_lower, blob_key, size, dirty FROM cache_entries`)
@@ -343,6 +448,7 @@ func (m *Manager) EvictPath(virtualPath string) (freedBytes int64, evictedFiles 
 		)
 	}
 	if err != nil {
+		m.stateMu.Unlock()
 		return 0, 0, 0, err
 	}
 
@@ -354,6 +460,7 @@ func (m *Manager) EvictPath(virtualPath string) (freedBytes int64, evictedFiles 
 		var dirtyInt int
 		if scanErr := rows.Scan(&pLower, &bKey, &sz, &dirtyInt); scanErr != nil {
 			_ = rows.Close()
+			m.stateMu.Unlock()
 			return 0, 0, 0, scanErr
 		}
 		if dirtyInt != 0 {
@@ -367,14 +474,17 @@ func (m *Manager) EvictPath(virtualPath string) (freedBytes int64, evictedFiles 
 		}
 	}
 	if closeErr := rows.Close(); closeErr != nil {
+		m.stateMu.Unlock()
 		return 0, 0, 0, closeErr
 	}
 	if len(cleanPaths) == 0 {
+		m.stateMu.Unlock()
 		return 0, 0, skippedDirty, nil
 	}
 
 	tx, err := m.db.Begin()
 	if err != nil {
+		m.stateMu.Unlock()
 		return 0, 0, skippedDirty, err
 	}
 	defer tx.Rollback()
@@ -382,6 +492,7 @@ func (m *Manager) EvictPath(virtualPath string) (freedBytes int64, evictedFiles 
 	for _, pLower := range cleanPaths {
 		res, execErr := tx.Exec(`DELETE FROM cache_entries WHERE path_lower = ? AND dirty = 0`, pLower)
 		if execErr != nil {
+			m.stateMu.Unlock()
 			return 0, 0, skippedDirty, execErr
 		}
 		if n, _ := res.RowsAffected(); n > 0 {
@@ -389,9 +500,14 @@ func (m *Manager) EvictPath(virtualPath string) (freedBytes int64, evictedFiles 
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		m.stateMu.Unlock()
 		return 0, 0, skippedDirty, err
 	}
+	m.stateMu.Unlock()
 	m.scheduleBlobDeletes(blobKeys)
+	if evictedFiles > 0 {
+		m.notifyChange(norm)
+	}
 	return freedBytes, evictedFiles, skippedDirty, nil
 }
 

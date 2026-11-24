@@ -401,12 +401,20 @@
         </div>
 
         <div id="desktop-settings-card" class="card hidden">
-          <h3>Cài đặt Windows Desktop &amp; Ổ đĩa ảo</h3>
+          <div class="row-between" style="flex-wrap:wrap;margin-bottom:10px">
+            <h3 style="margin:0">Cài đặt Windows Desktop &amp; Ổ đĩa ảo <span class="muted small" id="settings-app-version"></span></h3>
+            <div class="row-inline" style="flex-wrap:wrap">
+              <button type="button" class="btn btn-secondary small-btn" id="btn-settings-check-update">Kiểm tra phiên bản mới trên GitHub</button>
+              <a id="settings-update-link" class="btn btn-ghost small-btn hidden" href="#" target="_blank" rel="noreferrer">Xem release</a>
+              <button type="button" class="btn btn-primary small-btn hidden" id="btn-settings-apply-update">Cập nhật ngay</button>
+            </div>
+          </div>
+          <div id="settings-update-status" class="muted small hidden" style="margin-bottom:10px"></div>
           <div id="desktop-settings-err" class="alert alert-err hidden"></div>
           <form id="form-desktop-settings" class="stack">
             <div class="row-2">
-              <label>Chữ cái ổ đĩa (Drive Letter, vd: V:)
-                <input type="text" id="set-desktop-drive" placeholder="V:" maxlength="3" required />
+              <label>Chữ cái ổ đĩa (Drive Letter)
+                <select id="set-desktop-drive" required></select>
               </label>
               <label>Giới hạn Disk Cache (mặc định 10 GB)
                 <div class="row-inline">

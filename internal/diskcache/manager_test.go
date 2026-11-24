@@ -1132,4 +1132,111 @@ func TestEvictPathAndPathStatusPreservesDirtyAndCloud(t *testing.T) {
 	}
 }
 
+func TestOverlayStateAndOnChange(t *testing.T) {
+	dir := t.TempDir()
+	fb := newFakeBackend(true)
+	fb.PutFile("/Test/microg.apk", bytes.Repeat([]byte("M"), 128), "em")
+	fb.PutFile("/CloudOnly/note.txt", []byte("cloud"), "ec")
+
+	mgr, err := OpenWithBackend(filepath.Join(dir, "cache"), filepath.Join(dir, "cache.db"), DefaultMaxBytes, nil, fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	var changeCount atomic.Int32
+	mgr.SetOnChange(func(...string) {
+		changeCount.Add(1)
+	})
+
+	// Root and missing -> OverlayNone
+	if got := mgr.OverlayState("/"); got != OverlayNone {
+		t.Fatalf("OverlayState(/) = %c, want N", got)
+	}
+	if got := mgr.OverlayState("/does-not-exist.txt"); got != OverlayNone {
+		t.Fatalf("OverlayState(missing) = %c, want N", got)
+	}
+
+	// Uncached remote file and folder -> OverlayCloud
+	if got := mgr.OverlayState("/Test/microg.apk"); got != OverlayCloud {
+		t.Fatalf("uncached file = %c, want O", got)
+	}
+	if got := mgr.OverlayState("/Test"); got != OverlayCloud {
+		t.Fatalf("uncached dir = %c, want O", got)
+	}
+
+	// Reading caches file locally -> OverlayCached (both file & parent dir)
+	ctx := context.Background()
+	if _, err := mgr.ReadFileAt(ctx, "/Test/microg.apk", make([]byte, 128), 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.OverlayState("/test/MICROG.APK"); got != OverlayCached {
+		t.Fatalf("cached file = %c, want C", got)
+	}
+	if got := mgr.OverlayState("/Test"); got != OverlayCached {
+		t.Fatalf("dir with cached file = %c, want C", got)
+	}
+
+	// Pinning an already-cached file -> OverlayPinned
+	if err := mgr.SetPinnedPaths([]string{"/Test/microg.apk"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.OverlayState("/Test/microg.apk"); got != OverlayPinned {
+		t.Fatalf("pinned cached file = %c, want P", got)
+	}
+
+	// Pinning an uncached file -> OverlaySyncing until PinSync finishes -> OverlayPinned
+	if err := mgr.SetPinnedPaths([]string{"/Test/microg.apk", "/CloudOnly/note.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.OverlayState("/CloudOnly/note.txt"); got != OverlaySyncing {
+		t.Fatalf("pinned uncached file = %c, want S", got)
+	}
+	if err := mgr.PinSync(ctx, "/CloudOnly/note.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.OverlayState("/CloudOnly/note.txt"); got != OverlayPinned {
+		t.Fatalf("pinned synced file = %c, want P", got)
+	}
+
+	// Unpinning + EvictPath -> back to OverlayCloud
+	if err := mgr.SetPinnedPaths(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := mgr.EvictPath("/Test/microg.apk"); err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.OverlayState("/Test/microg.apk"); got != OverlayCloud {
+		t.Fatalf("evicted file = %c, want O", got)
+	}
+
+	// Offline dirty write -> OverlaySyncing until flushed -> OverlayCached
+	fb.SetOnline(false)
+	stPath, err := mgr.StageOpenForWrite("/Test/new.txt", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(stPath, []byte("hello"), 0o600)
+	if err := mgr.CommitFile(ctx, "/Test/new.txt", stPath, 5, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.OverlayState("/Test/new.txt"); got != OverlaySyncing {
+		t.Fatalf("dirty file = %c, want S", got)
+	}
+	if got := mgr.OverlayState("/Test"); got != OverlaySyncing {
+		t.Fatalf("dir with dirty file = %c, want S", got)
+	}
+
+	fb.SetOnline(true)
+	if err := mgr.FlushQueue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.OverlayState("/Test/new.txt"); got != OverlayCached {
+		t.Fatalf("flushed file = %c, want C", got)
+	}
+	if changeCount.Load() == 0 {
+		t.Fatal("expected onChange callback to be triggered on cache/pin/queue transitions")
+	}
+}
+
 

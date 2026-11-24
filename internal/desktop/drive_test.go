@@ -81,3 +81,31 @@ func TestBitmaskDriveCheckerValidationAndErrors(t *testing.T) {
 		t.Fatal("IsDriveInUse(\"V:\") = true on error, want false")
 	}
 }
+
+func TestListAvailableDrives(t *testing.T) {
+	// C:, D:, E:, V: are occupied; V: is TeleMount's current drive so it stays selectable.
+	mask := uint32(1<<('C'-'A')) | uint32(1<<('D'-'A')) | uint32(1<<('E'-'A')) | uint32(1<<('V'-'A'))
+	checker := &bitmaskDriveChecker{getMask: func() (uint32, error) { return mask, nil }}
+
+	got := ListAvailableDrives(checker, "v:")
+	contains := func(target string) bool {
+		for _, d := range got {
+			if d == target {
+				return true
+			}
+		}
+		return false
+	}
+	if contains("C:") || contains("D:") || contains("E:") {
+		t.Fatalf("occupied/system drives should be excluded, got %v", got)
+	}
+	if !contains("V:") || !contains("F:") || !contains("Z:") {
+		t.Fatalf("expected V:, F:, Z: in available drives, got %v", got)
+	}
+
+	// Configured A: is preserved at the front even though default range starts at D:.
+	gotA := ListAvailableDrives(checker, "A:")
+	if len(gotA) == 0 || gotA[0] != "A:" {
+		t.Fatalf("expected configured A: preserved first, got %v", gotA)
+	}
+}

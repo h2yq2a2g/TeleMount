@@ -623,6 +623,7 @@ func (m *Manager) CommitFile(ctx context.Context, p string, stagedPath string, s
 	m.stateMu.Unlock()
 
 	m.scheduleBlobDeletes([]string{oldCacheBlob, oldOverlayBlob})
+	m.notifyChange(normPath)
 
 	if m.backend != nil && m.backend.IsOnline() {
 		_ = m.FlushQueue(ctx)
@@ -705,6 +706,7 @@ func (m *Manager) QueueMkdir(ctx context.Context, p string) error {
 		return err
 	}
 	m.stateMu.Unlock()
+	m.notifyChange(normPath)
 
 	if m.backend != nil && m.backend.IsOnline() {
 		_ = m.FlushQueue(ctx)
@@ -1030,6 +1032,7 @@ func (m *Manager) QueueRename(ctx context.Context, oldPath, newPath string) erro
 	m.stateMu.Unlock()
 
 	m.scheduleBlobDeletes(blobsToDelete)
+	m.notifyChange(normOld, normNew)
 
 	if m.backend != nil && m.backend.IsOnline() {
 		_ = m.FlushQueue(ctx)
@@ -1142,6 +1145,7 @@ func (m *Manager) QueueDelete(ctx context.Context, p string, isDir bool) error {
 	m.stateMu.Unlock()
 
 	m.scheduleBlobDeletes(blobsToDelete)
+	m.notifyChange(normPath)
 
 	if m.backend != nil && m.backend.IsOnline() {
 		_ = m.FlushQueue(ctx)
@@ -1228,6 +1232,7 @@ func (m *Manager) QueueUtimens(ctx context.Context, p string, mtime int64) error
 		return err
 	}
 	m.stateMu.Unlock()
+	m.notifyChange(normPath)
 
 	if m.backend != nil && m.backend.IsOnline() {
 		_ = m.FlushQueue(ctx)
@@ -1313,6 +1318,10 @@ func (m *Manager) FlushQueue(ctx context.Context) error {
 		_ = m.evictToBudgetLocked()
 		m.stateMu.Unlock()
 
+		changedPaths := make([]string, 0, len(deferredWrites))
+		for _, w := range deferredWrites {
+			changedPaths = append(changedPaths, w.op.Path)
+		}
 		for _, pf := range payloads {
 			removeWithRetry(m.queuePayloadPath(pf))
 		}
@@ -1321,6 +1330,7 @@ func (m *Manager) FlushQueue(ctx context.Context) error {
 		m.lastError = ""
 		m.statusMu.Unlock()
 		deferredWrites = nil
+		m.notifyChange(changedPaths...)
 		return nil
 	}
 
@@ -1524,39 +1534,50 @@ func (m *Manager) retireSingleOp(op queueOpRow) error {
 		}
 	}
 
-	m.stateMu.Lock()
-	defer m.stateMu.Unlock()
+	err := func() error {
+		m.stateMu.Lock()
+		defer m.stateMu.Unlock()
 
-	tx, err := m.db.Begin()
+		tx, err := m.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		if _, err := tx.Exec(`DELETE FROM write_queue WHERE id = ?`, op.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM overlay_nodes WHERE last_op_id <= ?`, op.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE cache_entries SET dirty = 0 WHERE dirty = 1 AND last_op_id <= ?`, op.ID); err != nil {
+			return err
+		}
+		for _, r := range refreshes {
+			if _, err := tx.Exec(
+				`UPDATE cache_entries SET remote_node_id = ?, remote_etag = ? WHERE path_lower = ? AND last_op_id <= ?`,
+				r.nodeID, r.etag, r.pathLower, op.ID,
+			); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`UPDATE node_meta SET etag = ? WHERE path_lower = ?`, r.etag, r.pathLower); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return m.evictToBudgetLocked()
+	}()
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-
-	if _, err := tx.Exec(`DELETE FROM write_queue WHERE id = ?`, op.ID); err != nil {
-		return err
+	if op.NewPath != "" {
+		m.notifyChange(op.Path, op.NewPath)
+	} else {
+		m.notifyChange(op.Path)
 	}
-	if _, err := tx.Exec(`DELETE FROM overlay_nodes WHERE last_op_id <= ?`, op.ID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`UPDATE cache_entries SET dirty = 0 WHERE dirty = 1 AND last_op_id <= ?`, op.ID); err != nil {
-		return err
-	}
-	for _, r := range refreshes {
-		if _, err := tx.Exec(
-			`UPDATE cache_entries SET remote_node_id = ?, remote_etag = ? WHERE path_lower = ? AND last_op_id <= ?`,
-			r.nodeID, r.etag, r.pathLower, op.ID,
-		); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`UPDATE node_meta SET etag = ? WHERE path_lower = ?`, r.etag, r.pathLower); err != nil {
-			return err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return m.evictToBudgetLocked()
+	return nil
 }
 
 // StartSyncLoop starts a background goroutine that flushes queued ops while online.

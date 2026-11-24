@@ -7,6 +7,9 @@
 #ifndef AppExePath
   #define AppExePath "..\dist\telemount.exe"
 #endif
+#ifndef ShellDllPath
+  #define ShellDllPath "..\dist\telemount_shell.dll"
+#endif
 #ifndef WinFspMsiPath
   #define WinFspMsiPath "..\dist\winfsp.msi"
 #endif
@@ -36,6 +39,7 @@ WizardStyle=modern
 CloseApplications=yes
 CloseApplicationsFilter=telemount.exe
 RestartApplications=no
+ChangesAssociations=yes
 SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\telemount.exe
 
@@ -48,6 +52,7 @@ Name: "startup"; Description: "Run TeleMount automatically at Windows startup (m
 
 [Files]
 Source: "{#AppExePath}"; DestDir: "{app}"; DestName: "telemount.exe"; Flags: ignoreversion
+Source: "{#ShellDllPath}"; DestDir: "{app}"; DestName: "telemount_shell.dll"; Flags: ignoreversion regserver 64bit restartreplace uninsrestartdelete
 Source: "{#WinFspMsiPath}"; DestDir: "{tmp}"; DestName: "winfsp.msi"; Flags: deleteafterinstall; Check: NeedsWinFsp
 
 [Icons]
@@ -67,6 +72,24 @@ Filename: "{app}\telemount.exe"; Parameters: "--minimized"; Flags: nowait skipif
 [Code]
 var
   WinFspRebootRequired: Boolean;
+  ShellOverlayWasRegistered: Boolean;
+
+function InitializeSetup: Boolean;
+begin
+  ShellOverlayWasRegistered := RegKeyExists(HKLM64, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\  TeleMount1Pinned');
+  Result := True;
+end;
+
+procedure RestartExplorerAsUser;
+var
+  ResultCode: Integer;
+begin
+  // Explorer loads ShellIconOverlayIdentifiers only at startup; restart once as the non-elevated user.
+  ExecAsOriginalUser(ExpandConstant('{sys}\taskkill.exe'), '/f /im explorer.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(1000);
+  if FindWindowByClassName('Shell_TrayWnd') = 0 then
+    ExecAsOriginalUser(ExpandConstant('{win}\explorer.exe'), '', '', SW_SHOWNORMAL, ewNoWait, ResultCode);
+end;
 
 function NeedsWinFsp: Boolean;
 var
@@ -117,6 +140,11 @@ begin
     begin
       MsgBox('WinFsp installation exited with code ' + IntToStr(ResultCode) + '. TeleMount is installed, but you may need to install WinFsp manually from https://winfsp.dev.', mbError, MB_OK);
     end;
+  end;
+
+  if (CurStep = ssPostInstall) and (not ShellOverlayWasRegistered) then
+  begin
+    RestartExplorerAsUser;
   end;
 end;
 

@@ -33,8 +33,9 @@ function applyDesktopVisibility() {
   if ($('dash-title')) {
     $('dash-title').textContent = isDesktop ? 'Tổng quan & Vận hành' : 'Tổng quan & Vận hành WebDAV';
   }
-  if (!isDesktop && $('desktop-winfsp-banner')) {
-    $('desktop-winfsp-banner').classList.add('hidden');
+  if (!isDesktop) {
+    if ($('desktop-winfsp-banner')) $('desktop-winfsp-banner').classList.add('hidden');
+    if ($('desktop-update-banner')) $('desktop-update-banner').classList.add('hidden');
   }
 }
 
@@ -989,18 +990,7 @@ function renderDesktopStatus(d) {
   $('desktop-winfsp-guidance').textContent =
     d.winfsp_guidance || 'Cài đặt WinFsp từ winfsp.dev hoặc chạy winget install WinFsp.WinFsp để bật ổ đĩa ảo.';
 
-  if ($('desktop-app-version')) {
-    $('desktop-app-version').textContent = d.app_version ? `(${d.app_version})` : '';
-  }
-  const updBanner = $('desktop-update-banner');
-  if (updBanner) {
-    updBanner.classList.toggle('hidden', !d.update_available);
-    if (d.update_available) {
-      $('desktop-update-title').textContent = `Có phiên bản TeleMount mới: ${d.latest_version}`;
-      $('desktop-update-desc').textContent = `Đang dùng ${d.app_version || 'dev'} · Bản cài sẽ được xác thực SHA-256 trước khi cập nhật.`;
-      if (d.release_url) $('desktop-update-link').href = d.release_url;
-    }
-  }
+  renderDesktopUpdateUI(d);
 
   $('desktop-drive-letter').textContent = d.drive_letter || 'V:';
   const badge = $('desktop-mount-badge');
@@ -1117,9 +1107,54 @@ $('btn-desktop-clear-cache').addEventListener('click', async () => {
   }
 });
 
-$('btn-desktop-check-update').addEventListener('click', async () => {
-  const btn = $('btn-desktop-check-update');
-  btn.disabled = true;
+function renderDesktopUpdateUI(d) {
+  if (!d) return;
+  const verText = d.app_version ? `(${d.app_version})` : '';
+  if ($('desktop-app-version')) $('desktop-app-version').textContent = verText;
+  if ($('settings-app-version')) $('settings-app-version').textContent = verText;
+
+  const updBanner = $('desktop-update-banner');
+  if (updBanner) {
+    updBanner.classList.toggle('hidden', !d.update_available);
+    if (d.update_available) {
+      $('desktop-update-title').textContent = `Có phiên bản TeleMount mới: ${d.latest_version}`;
+      $('desktop-update-desc').textContent = `Đang dùng ${d.app_version || 'dev'} · Bản cài sẽ được xác thực SHA-256 trước khi cập nhật.`;
+      if (d.release_url) $('desktop-update-link').href = d.release_url;
+    }
+  }
+
+  const stEl = $('settings-update-status');
+  const linkEl = $('settings-update-link');
+  const applyEl = $('btn-settings-apply-update');
+  if (stEl && linkEl && applyEl) {
+    if (d.update_available) {
+      stEl.textContent = `Đã có phiên bản mới ${d.latest_version} (hiện tại: ${d.app_version || 'dev'}). Bấm "Cập nhật ngay" để tải, kiểm tra SHA-256 và tự nâng cấp.`;
+      stEl.className = 'alert alert-info';
+      if (d.release_url) {
+        linkEl.href = d.release_url;
+        linkEl.classList.remove('hidden');
+      }
+      applyEl.classList.remove('hidden');
+    } else if (d.update_error) {
+      stEl.textContent = `Lỗi kiểm tra cập nhật: ${d.update_error}`;
+      stEl.className = 'muted small';
+      linkEl.classList.add('hidden');
+      applyEl.classList.add('hidden');
+    } else if (d.latest_version) {
+      stEl.textContent = `Đang dùng phiên bản mới nhất (${d.app_version || d.latest_version}).`;
+      stEl.className = 'muted small';
+      linkEl.classList.add('hidden');
+      applyEl.classList.add('hidden');
+    } else {
+      stEl.classList.add('hidden');
+      linkEl.classList.add('hidden');
+      applyEl.classList.add('hidden');
+    }
+  }
+}
+
+async function runDesktopUpdateCheck(btn) {
+  if (btn) btn.disabled = true;
   try {
     const r = await api('/api/desktop/update/check', { method: 'POST' });
     if (r && r.status) {
@@ -1133,22 +1168,26 @@ $('btn-desktop-check-update').addEventListener('click', async () => {
   } catch (err) {
     toast(err.message, 'err');
   } finally {
-    btn.disabled = false;
+    if (btn) btn.disabled = false;
   }
-});
+}
 
-$('btn-desktop-apply-update').addEventListener('click', async () => {
-  const btn = $('btn-desktop-apply-update');
-  btn.disabled = true;
+async function runDesktopUpdateApply(btn) {
+  if (btn) btn.disabled = true;
   try {
     toast('Đang tải, kiểm tra SHA-256 và khởi chạy bộ cài cập nhật...');
     await api('/api/desktop/update/apply', { method: 'POST' });
     toast('Đang cập nhật TeleMount — app sẽ tự khởi động lại trong giây lát!');
   } catch (err) {
     toast(err.message, 'err');
-    btn.disabled = false;
+    if (btn) btn.disabled = false;
   }
-});
+}
+
+$('btn-desktop-check-update').addEventListener('click', () => runDesktopUpdateCheck($('btn-desktop-check-update')));
+$('btn-settings-check-update').addEventListener('click', () => runDesktopUpdateCheck($('btn-settings-check-update')));
+$('btn-desktop-apply-update').addEventListener('click', () => runDesktopUpdateApply($('btn-desktop-apply-update')));
+$('btn-settings-apply-update').addEventListener('click', () => runDesktopUpdateApply($('btn-settings-apply-update')));
 
 function bytesToCacheInput(bytes) {
   const GiB = 1024 * 1024 * 1024;
@@ -1192,8 +1231,27 @@ function normalizePinnedPathsInput(text) {
   return out;
 }
 
+function populateDriveSelect(d) {
+  const sel = $('set-desktop-drive');
+  const cur = (d.drive_letter || 'V:').toUpperCase();
+  let drives = Array.isArray(d.available_drives) && d.available_drives.length > 0
+    ? [...d.available_drives]
+    : Array.from({ length: 23 }, (_, i) => String.fromCharCode(68 + i) + ':');
+  if (!drives.includes(cur)) drives.unshift(cur);
+
+  sel.innerHTML = '';
+  for (const drv of drives) {
+    const opt = document.createElement('option');
+    opt.value = drv;
+    opt.textContent = drv === cur && d.mounted ? `${drv} (đang gắn)` : drv;
+    sel.appendChild(opt);
+  }
+  sel.value = cur;
+}
+
 function populateDesktopSettingsForm(d) {
-  $('set-desktop-drive').value = d.drive_letter || 'V:';
+  populateDriveSelect(d);
+  renderDesktopUpdateUI(d);
   const c = bytesToCacheInput(d.disk_cache_max_bytes || 10 * 1024 * 1024 * 1024);
   $('set-desktop-cache-val').value = c.val;
   $('set-desktop-cache-unit').value = c.unit;

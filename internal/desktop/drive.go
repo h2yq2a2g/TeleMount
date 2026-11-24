@@ -53,3 +53,32 @@ func (c *bitmaskDriveChecker) IsDriveInUse(drive string) (bool, error) {
 	bit := uint(letter - 'A')
 	return (mask & (uint32(1) << bit)) != 0, nil
 }
+
+// ListAvailableDrives returns selectable Windows drive letters (D:-Z:, excluding C:)
+// that are currently free, always including currentDrive (normalized) so the active
+// mount stays selected in dropdown UIs.
+func ListAvailableDrives(checker DriveChecker, currentDrive string) []string {
+	cur, _ := NormalizeDriveLetter(currentDrive)
+	out := make([]string, 0, 23)
+	includedCur := false
+	for ch := byte('D'); ch <= 'Z'; ch++ {
+		drv := string(ch) + ":"
+		if drv == cur {
+			out = append(out, drv)
+			includedCur = true
+			continue
+		}
+		if checker != nil {
+			inUse, err := checker.IsDriveInUse(drv)
+			if err == nil && inUse {
+				continue
+			}
+		}
+		out = append(out, drv)
+	}
+	// Preserve A: or B: if the user explicitly configured it earlier.
+	if cur != "" && !includedCur {
+		out = append([]string{cur}, out...)
+	}
+	return out
+}
