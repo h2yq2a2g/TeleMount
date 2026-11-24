@@ -33,14 +33,30 @@ func (e *Engine) MirrorMsgAsync(primaryMsgID int, isDBBackup bool) {
 
 // MirrorMsg performs zero-bandwidth server-side copy (DropAuthor: true) of primaryMsgID into every configured backup account's private channel.
 func (e *Engine) MirrorMsg(ctx context.Context, primaryMsgID int, isDBBackup bool) error {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+
 	primarySnap := e.state.Snapshot()
 	backups := primarySnap.BackupAccounts
 	if len(backups) == 0 || primarySnap.ChannelID == 0 {
 		return nil
 	}
 
+	var existing map[string]bool
+	if !isDBBackup {
+		if reps, err := e.store.GetBlobReplicas(primaryMsgID); err == nil && len(reps) > 0 {
+			existing = make(map[string]bool, len(reps))
+			for _, r := range reps {
+				existing[r.AccountID] = true
+			}
+		}
+	}
+
 	var firstErr error
 	for _, acc := range backups {
+		if existing[acc.ID] {
+			continue
+		}
 		if acc.OwnChannelID == 0 || acc.SourceChannelID != primarySnap.ChannelID || acc.SourceChannelAccessHash == 0 {
 			continue
 		}
