@@ -227,6 +227,18 @@ func renameWithRetry(src, dst string) error {
 	return nil
 }
 
+// linkOrCopyAtomic creates an immutable blob from an immutable queue payload.
+// Hard-linking is O(1) with 0 extra disk bytes on NTFS/POSIX; falls back to copying on FAT32/exFAT or cross-volume.
+func linkOrCopyAtomic(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	return copyFileAtomic(src, dst)
+}
+
 func copyFileAtomic(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err

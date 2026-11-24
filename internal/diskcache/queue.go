@@ -24,6 +24,10 @@ const (
 	OpRename  QueueOpType = "rename"
 	OpDelete  QueueOpType = "delete"
 	OpUtimens QueueOpType = "utimens"
+
+	// Large streamed uploads (>= 16 MiB, bypassing the RAM Packer) retire right away
+	// so their queue payload link is unlinked and Explorer overlay icons update immediately.
+	largeWriteRetireThreshold int64 = 16 * 1024 * 1024
 )
 
 type QueueStatus struct {
@@ -505,7 +509,7 @@ func (m *Manager) CommitFile(ctx context.Context, p string, stagedPath string, s
 			return err
 		}
 		blobKey = newHexID()
-		if err := copyFileAtomic(qDest, m.blobPath(blobKey)); err != nil {
+		if err := linkOrCopyAtomic(qDest, m.blobPath(blobKey)); err != nil {
 			removeWithRetry(qDest)
 			return err
 		}
@@ -625,9 +629,7 @@ func (m *Manager) CommitFile(ctx context.Context, p string, stagedPath string, s
 	m.scheduleBlobDeletes([]string{oldCacheBlob, oldOverlayBlob})
 	m.notifyChange(normPath)
 
-	if m.backend != nil && m.backend.IsOnline() {
-		_ = m.FlushQueue(ctx)
-	}
+	m.triggerFlush(ctx)
 	return nil
 }
 
@@ -708,9 +710,7 @@ func (m *Manager) QueueMkdir(ctx context.Context, p string) error {
 	m.stateMu.Unlock()
 	m.notifyChange(normPath)
 
-	if m.backend != nil && m.backend.IsOnline() {
-		_ = m.FlushQueue(ctx)
-	}
+	m.triggerFlush(ctx)
 	return nil
 }
 
@@ -1034,9 +1034,7 @@ func (m *Manager) QueueRename(ctx context.Context, oldPath, newPath string) erro
 	m.scheduleBlobDeletes(blobsToDelete)
 	m.notifyChange(normOld, normNew)
 
-	if m.backend != nil && m.backend.IsOnline() {
-		_ = m.FlushQueue(ctx)
-	}
+	m.triggerFlush(ctx)
 	return nil
 }
 
@@ -1147,9 +1145,7 @@ func (m *Manager) QueueDelete(ctx context.Context, p string, isDir bool) error {
 	m.scheduleBlobDeletes(blobsToDelete)
 	m.notifyChange(normPath)
 
-	if m.backend != nil && m.backend.IsOnline() {
-		_ = m.FlushQueue(ctx)
-	}
+	m.triggerFlush(ctx)
 	return nil
 }
 
@@ -1234,9 +1230,7 @@ func (m *Manager) QueueUtimens(ctx context.Context, p string, mtime int64) error
 	m.stateMu.Unlock()
 	m.notifyChange(normPath)
 
-	if m.backend != nil && m.backend.IsOnline() {
-		_ = m.FlushQueue(ctx)
-	}
+	m.triggerFlush(ctx)
 	return nil
 }
 
@@ -1247,10 +1241,36 @@ type appliedWrite struct {
 	preservedMt int64
 }
 
+// triggerFlush wakes the background sync loop without blocking filesystem callers when active,
+// or flushes synchronously when StartSyncLoop has not been started (e.g. direct unit/E2E calls).
+func (m *Manager) triggerFlush(ctx context.Context) {
+	if m.backend == nil || !m.backend.IsOnline() {
+		return
+	}
+	m.syncMu.Lock()
+	async := m.syncStarted && !m.closed
+	m.syncMu.Unlock()
+	if async {
+		select {
+		case m.flushWakeCh <- struct{}{}:
+		default:
+		}
+		return
+	}
+	_ = m.FlushQueue(ctx)
+}
+
 // FlushQueue replays queued offline operations in strict FIFO order while online.
 func (m *Manager) FlushQueue(ctx context.Context) error {
-	m.flushMu.Lock()
-	defer m.flushMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case m.flushSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-m.flushSem }()
 
 	m.statusMu.Lock()
 	m.syncing = true
@@ -1392,6 +1412,12 @@ func (m *Manager) FlushQueue(ctx context.Context) error {
 				preservedMt: op.Mtime,
 			})
 			lastProcessedID = op.ID
+			if op.Size >= largeWriteRetireThreshold {
+				if ferr := flushDeferredWrites(); ferr != nil {
+					m.setLastError(ferr.Error())
+					return ferr
+				}
+			}
 			continue
 		}
 
@@ -1590,25 +1616,34 @@ func (m *Manager) StartSyncLoop(ctx context.Context, interval time.Duration) {
 		m.syncMu.Unlock()
 		return
 	}
+	loopCtx, cancel := context.WithCancel(ctx)
 	m.syncStarted = true
+	m.syncCancel = cancel
 	m.syncWg.Add(1)
 	m.syncMu.Unlock()
 
 	go func() {
 		defer m.syncWg.Done()
+		defer cancel()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
+		tryFlush := func() {
+			if m.backend != nil && m.backend.IsOnline() && m.QueueStatus().PendingCount > 0 {
+				_ = m.FlushQueue(loopCtx)
+			}
+		}
+
 		for {
 			select {
-			case <-ctx.Done():
+			case <-loopCtx.Done():
 				return
 			case <-m.closeCh:
 				return
+			case <-m.flushWakeCh:
+				tryFlush()
 			case <-ticker.C:
-				if m.backend != nil && m.backend.IsOnline() && m.QueueStatus().PendingCount > 0 {
-					_ = m.FlushQueue(ctx)
-				}
+				tryFlush()
 			}
 		}
 	}()

@@ -676,7 +676,18 @@ func (f *TeleFS) Open(p string, flags int) (int, uint64) {
 	}
 
 	trunc := flags&fuse.O_TRUNC != 0
-	stPath, err := f.cache.StageOpenForWrite(ov.Path, trunc)
+	if !trunc {
+		// Defer staging copy until Write/Truncate so O_RDWR probes on large files do not duplicate gigabytes on disk.
+		return 0, f.registerHandle(&openHandle{
+			path:       ov.Path,
+			flags:      flags,
+			writable:   true,
+			appendMode: flags&fuse.O_APPEND != 0,
+			dirty:      false,
+			mtime:      ov.Mtime,
+		})
+	}
+	stPath, err := f.cache.StageOpenForWrite(ov.Path, true)
 	if err != nil {
 		return mapErr(err), ^uint64(0)
 	}
@@ -693,11 +704,8 @@ func (f *TeleFS) Open(p string, flags int) (int, uint64) {
 		appendMode: flags&fuse.O_APPEND != 0,
 		stagedPath: stPath,
 		stagedFile: osf,
-		dirty:      trunc,
-		mtime:      ov.Mtime,
-	}
-	if trunc {
-		h.mtime = time.Now().Unix()
+		dirty:      true,
+		mtime:      time.Now().Unix(),
 	}
 	return 0, f.registerHandle(h)
 }
@@ -844,8 +852,41 @@ func (f *TeleFS) Fsyncdir(_ string, _ bool, _ uint64) int {
 	return 0
 }
 
+func parseUtimens(tmsp []fuse.Timespec) (mtime int64, apply bool) {
+	mtime = time.Now().Unix()
+	if len(tmsp) >= 2 {
+		if tmsp[1].Nsec == fuse.UTIME_OMIT {
+			return 0, false
+		}
+		if tmsp[1].Nsec != fuse.UTIME_NOW {
+			mtime = tmsp[1].Sec
+		}
+	} else if len(tmsp) == 1 {
+		if tmsp[0].Nsec == fuse.UTIME_OMIT {
+			return 0, false
+		}
+		if tmsp[0].Nsec != fuse.UTIME_NOW {
+			mtime = tmsp[0].Sec
+		}
+	}
+	return mtime, true
+}
+
 func (f *TeleFS) Utimens(p string, tmsp []fuse.Timespec) int {
 	norm := diskcache.NormalizePath(p)
+	// Explorer sets source mtime via SetFileTime before CloseHandle on newly created files.
+	if h := f.findOpenDirtyByPath(norm); h != nil {
+		h.mu.Lock()
+		if h.dirty {
+			if mtime, apply := parseUtimens(tmsp); apply {
+				h.mtime = mtime
+			}
+			h.mu.Unlock()
+			return 0
+		}
+		h.mu.Unlock()
+	}
+
 	ov, found, err := f.cache.Stat(norm)
 	if err != nil {
 		return mapErr(err)
@@ -854,21 +895,9 @@ func (f *TeleFS) Utimens(p string, tmsp []fuse.Timespec) int {
 		return -fuse.ENOENT
 	}
 
-	mtime := time.Now().Unix()
-	if len(tmsp) >= 2 {
-		if tmsp[1].Nsec == fuse.UTIME_OMIT {
-			return 0
-		}
-		if tmsp[1].Nsec != fuse.UTIME_NOW {
-			mtime = tmsp[1].Sec
-		}
-	} else if len(tmsp) == 1 {
-		if tmsp[0].Nsec == fuse.UTIME_OMIT {
-			return 0
-		}
-		if tmsp[0].Nsec != fuse.UTIME_NOW {
-			mtime = tmsp[0].Sec
-		}
+	mtime, apply := parseUtimens(tmsp)
+	if !apply {
+		return 0
 	}
 
 	if err := f.cache.QueueUtimens(context.Background(), ov.Path, mtime); err != nil {

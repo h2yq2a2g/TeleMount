@@ -618,3 +618,165 @@ func TestQueueRenameOverwriteGuardsAndCrossDirStageCommit(t *testing.T) {
 		t.Fatalf("expected ErrInvalidMove, got %v", err)
 	}
 }
+
+type blockingWriteBackend struct {
+	*fakeBackend
+	writeStarted chan string
+	releaseWrite chan struct{}
+}
+
+func (b *blockingWriteBackend) WriteFile(ctx context.Context, p string, r io.Reader, size int64, mtime int64) (*RemoteNode, error) {
+	select {
+	case b.writeStarted <- p:
+	default:
+	}
+	select {
+	case <-b.releaseWrite:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return b.fakeBackend.WriteFile(ctx, p, r, size, mtime)
+}
+
+func TestAsyncSyncLoopDoesNotBlockCommitOrMutationsDuringSlowUpload(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	fb := newFakeBackend(true)
+	fb.PutDir("/Games")
+	bb := &blockingWriteBackend{
+		fakeBackend:  fb,
+		writeStarted: make(chan string, 4),
+		releaseWrite: make(chan struct{}),
+	}
+
+	mgr, err := OpenWithBackend(cacheDir, filepath.Join(dir, "cache.db"), DefaultMaxBytes, nil, bb)
+	if err != nil {
+		t.Fatalf("OpenWithBackend: %v", err)
+	}
+	defer mgr.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Long poll interval proves flushWakeCh triggers background upload immediately.
+	mgr.StartSyncLoop(ctx, 10*time.Second)
+
+	payload := bytes.Repeat([]byte("BIG-5GB-SIM-"), 4096)
+	staged, err := mgr.StageOpenForWrite("/Games/big.zip", true)
+	if err != nil {
+		t.Fatalf("StageOpenForWrite: %v", err)
+	}
+	writeStagedFile(t, staged, payload)
+
+	start := time.Now()
+	if err := mgr.CommitFile(ctx, "/Games/big.zip", staged, int64(len(payload)), 1700000100); err != nil {
+		t.Fatalf("CommitFile: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("CommitFile blocked for %v while upload was in progress", elapsed)
+	}
+
+	select {
+	case gotPath := <-bb.writeStarted:
+		if gotPath != "/Games/big.zip" {
+			t.Fatalf("upload started for %q, want /Games/big.zip", gotPath)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("background upload did not start immediately via flushWakeCh")
+	}
+
+	if st := mgr.OverlayState("/Games/big.zip"); st != OverlaySyncing {
+		t.Fatalf("OverlayState while uploading = %q, want %q", st, OverlaySyncing)
+	}
+
+	// Subsequent filesystem metadata mutations, reads, and directory listings must stay non-blocking.
+	opStart := time.Now()
+	if err := mgr.QueueMkdir(ctx, "/Games/Other"); err != nil {
+		t.Fatalf("QueueMkdir during upload: %v", err)
+	}
+	if err := mgr.QueueUtimens(ctx, "/Games/big.zip", 1700000200); err != nil {
+		t.Fatalf("QueueUtimens during upload: %v", err)
+	}
+	if _, err := mgr.ListDir("/Games"); err != nil {
+		t.Fatalf("ListDir during upload: %v", err)
+	}
+	readBuf := make([]byte, len(payload))
+	if n, err := mgr.ReadFileAt(ctx, "/Games/big.zip", readBuf, 0); err != nil || n != len(payload) || !bytes.Equal(readBuf, payload) {
+		t.Fatalf("ReadFileAt during upload = (%d, %v)", n, err)
+	}
+	if elapsed := time.Since(opStart); elapsed > 500*time.Millisecond {
+		t.Fatalf("concurrent ops blocked for %v behind slow upload", elapsed)
+	}
+
+	// Explicit FlushQueue with a short deadline must respect ctx.Done() instead of hanging on flushSem.
+	shortCtx, shortCancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	err = mgr.FlushQueue(shortCtx)
+	shortCancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("FlushQueue with short timeout = %v, want DeadlineExceeded", err)
+	}
+
+	// Unblock upload and verify queue payload is unlinked while hard-linked blob stays intact.
+	close(bb.releaseWrite)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if mgr.QueueStatus().PendingCount == 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if qs := mgr.QueueStatus(); qs.PendingCount != 0 {
+		t.Fatalf("queue did not drain after unblocking upload: %+v", qs)
+	}
+	if st := mgr.OverlayState("/Games/big.zip"); st != OverlayCached {
+		t.Fatalf("OverlayState after upload = %q, want %q", st, OverlayCached)
+	}
+	if qEntries, err := os.ReadDir(filepath.Join(cacheDir, "queue")); err != nil || len(qEntries) != 0 {
+		t.Fatalf("expected empty queue/ after flush, got %d entries (err=%v)", len(qEntries), err)
+	}
+	postBuf := make([]byte, len(payload))
+	if n, err := mgr.ReadFileAt(ctx, "/Games/big.zip", postBuf, 0); err != nil || n != len(payload) || !bytes.Equal(postBuf, payload) {
+		t.Fatalf("hard-linked blob read after queue unlink = (%d, %v)", n, err)
+	}
+}
+
+func TestCloseCancelsInFlightSlowUpload(t *testing.T) {
+	dir := t.TempDir()
+	fb := newFakeBackend(true)
+	bb := &blockingWriteBackend{
+		fakeBackend:  fb,
+		writeStarted: make(chan string, 2),
+		releaseWrite: make(chan struct{}),
+	}
+
+	mgr, err := OpenWithBackend(filepath.Join(dir, "cache"), filepath.Join(dir, "cache.db"), DefaultMaxBytes, nil, bb)
+	if err != nil {
+		t.Fatalf("OpenWithBackend: %v", err)
+	}
+	mgr.StartSyncLoop(context.Background(), 10*time.Second)
+
+	staged, err := mgr.StageOpenForWrite("/in-flight.bin", true)
+	if err != nil {
+		t.Fatalf("StageOpenForWrite: %v", err)
+	}
+	writeStagedFile(t, staged, []byte("keep-safe"))
+	if err := mgr.CommitFile(context.Background(), "/in-flight.bin", staged, 9, 1700000300); err != nil {
+		t.Fatalf("CommitFile: %v", err)
+	}
+
+	select {
+	case <-bb.writeStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- mgr.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close hung waiting on in-flight upload")
+	}
+}

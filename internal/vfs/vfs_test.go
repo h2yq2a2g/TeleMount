@@ -5,6 +5,7 @@ package vfs
 import (
 	"bytes"
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -82,6 +83,65 @@ func TestTeleFSAtomicSaveWritebackAndCaseInsensitivity(t *testing.T) {
 	if n != len(v2) || !bytes.Equal(buf, v2) {
 		t.Fatalf("Read got %q (n=%d), want %q", buf[:max(0, n)], n, v2)
 	}
+}
+
+func TestTeleFSOpenRDWRIsLazyAndUtimensBeforeFlushPreservesMtime(t *testing.T) {
+	dir := t.TempDir()
+	store, err := db.Open(filepath.Join(dir, "telemount.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	cacheDir := filepath.Join(dir, "cache")
+	cache, err := diskcache.Open(cacheDir, filepath.Join(dir, "desktop_cache.db"), desktop.DefaultDiskCacheMaxBytes, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cache.Close() })
+	fs := NewTeleFS(store, cache)
+
+	// Simulate Explorer CopyFileEx: Create -> Write -> SetFileTime (Utimens) -> Flush -> Release.
+	rc, fh := fs.Create("/copy.bin", fuse.O_CREAT|fuse.O_WRONLY|fuse.O_TRUNC, 0o644)
+	if rc != 0 {
+		t.Fatalf("Create rc=%d", rc)
+	}
+	data := []byte("explorer-large-copy-sim")
+	if n := fs.Write("/copy.bin", data, 0, fh); n != len(data) {
+		t.Fatalf("Write = %d", n)
+	}
+	const wantMtime int64 = 1712345678
+	if rc := fs.Utimens("/copy.bin", []fuse.Timespec{{Sec: wantMtime}, {Sec: wantMtime}}); rc != 0 {
+		t.Fatalf("Utimens on open dirty handle rc=%d", rc)
+	}
+	if rc := fs.Flush("/copy.bin", fh); rc != 0 {
+		t.Fatalf("Flush rc=%d", rc)
+	}
+	if rc := fs.Release("/copy.bin", fh); rc != 0 {
+		t.Fatalf("Release rc=%d", rc)
+	}
+
+	var st fuse.Stat_t
+	if rc := fs.Getattr("/copy.bin", &st, 0); rc != 0 || st.Mtim.Sec != wantMtime || st.Size != int64(len(data)) {
+		t.Fatalf("Getattr = (rc=%d, size=%d, mtim=%d), want (0, %d, %d)", rc, st.Size, st.Mtim.Sec, len(data), wantMtime)
+	}
+
+	// Opening with O_RDWR without O_TRUNC and without writing must NOT copy the blob into staging/.
+	rc, rwfh := fs.Open("/copy.bin", fuse.O_RDWR)
+	if rc != 0 {
+		t.Fatalf("Open(O_RDWR) rc=%d", rc)
+	}
+	stagingEntries, err := os.ReadDir(filepath.Join(cacheDir, "staging"))
+	if err != nil {
+		t.Fatalf("ReadDir staging: %v", err)
+	}
+	if len(stagingEntries) != 0 {
+		t.Fatalf("expected lazy Open(O_RDWR) to create 0 staging files, got %d", len(stagingEntries))
+	}
+	got := make([]byte, len(data))
+	if n := fs.Read("/copy.bin", got, 0, rwfh); n != len(data) || !bytes.Equal(got, data) {
+		t.Fatalf("Read on lazy O_RDWR handle = (%d, %q)", n, got[:max(0, n)])
+	}
+	_ = fs.Release("/copy.bin", rwfh)
 }
 
 func TestMountManagerRejectsMissingWinFspSafely(t *testing.T) {

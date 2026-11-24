@@ -50,10 +50,11 @@ type Manager struct {
 	store    *db.Store
 	backend  Backend
 
-	flushMu  sync.Mutex
-	stateMu  sync.Mutex
-	statusMu sync.Mutex
-	syncMu   sync.Mutex
+	flushSem    chan struct{}
+	flushWakeCh chan struct{}
+	stateMu     sync.Mutex
+	statusMu    sync.Mutex
+	syncMu      sync.Mutex
 
 	maxBytes     int64
 	pinnedPaths  []string
@@ -72,6 +73,7 @@ type Manager struct {
 	lastSyncedAt int64
 
 	syncStarted bool
+	syncCancel  context.CancelFunc
 	closed      bool
 	closeCh     chan struct{}
 	syncWg      sync.WaitGroup
@@ -115,6 +117,8 @@ func OpenWithBackend(cacheDir, dbPath string, maxBytes int64, store *db.Store, b
 		db:                  conn,
 		store:               store,
 		backend:             backend,
+		flushSem:            make(chan struct{}, 1),
+		flushWakeCh:         make(chan struct{}, 1),
 		maxBytes:            maxBytes,
 		activeBlobReaders:   make(map[string]int),
 		deferredBlobDeletes: make(map[string]bool),
@@ -218,8 +222,12 @@ func (m *Manager) Close() error {
 	}
 	m.closed = true
 	close(m.closeCh)
+	cancel := m.syncCancel
 	m.syncMu.Unlock()
 
+	if cancel != nil {
+		cancel()
+	}
 	m.syncWg.Wait()
 	return m.db.Close()
 }
