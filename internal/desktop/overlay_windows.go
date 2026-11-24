@@ -3,6 +3,7 @@
 package desktop
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -92,7 +93,12 @@ func startOverlayServerNamed(shmName, pipeName string, query OverlayQueryFunc) (
 		uint32(unsafe.Sizeof(sharedShellState{})),
 		namePtr,
 	)
-	if err != nil {
+	// x/sys/windows returns ERROR_ALREADY_EXISTS alongside a valid handle when explorer.exe
+	// (telemount_shell.dll) still holds Local\TeleMountShellState open across restarts/upgrades.
+	if hMap == 0 || (err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS)) {
+		if hMap != 0 {
+			_ = windows.CloseHandle(hMap)
+		}
 		return nil, fmt.Errorf("create shared overlay state: %w", err)
 	}
 	view, err := windows.MapViewOfFile(hMap, windows.FILE_MAP_WRITE|windows.FILE_MAP_READ, 0, 0, unsafe.Sizeof(sharedShellState{}))

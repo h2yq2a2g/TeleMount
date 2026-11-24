@@ -113,6 +113,27 @@ func TestOverlayServerSharedMemoryAndPipe(t *testing.T) {
 	if hdr.driveLetter != 0 {
 		t.Fatalf("expected driveLetter cleared to 0 after Close, got %c", hdr.driveLetter)
 	}
+
+	// Regression test: while explorer.exe (simulated by our open hMap handle) keeps the shared
+	// mapping alive across restarts/auto-updates, a new OverlayServer must attach despite
+	// CreateFileMapping returning ERROR_ALREADY_EXISTS and serve the Named Pipe cleanly.
+	srv2, err := startOverlayServerNamed(shmName, pipeName, func(vp string) byte {
+		if vp == "/Test" {
+			return 'O'
+		}
+		return 'N'
+	})
+	if err != nil {
+		t.Fatalf("restart startOverlayServerNamed with existing mapping failed: %v", err)
+	}
+	defer srv2.Close()
+	srv2.SetDrive("G:")
+	if hdr.driveLetter != 'G' {
+		t.Fatalf("restarted server driveLetter = %c, want G", hdr.driveLetter)
+	}
+	if got := queryPipe("/Test"); got != 'O' {
+		t.Fatalf("restarted pipe(/Test) = %c, want O", got)
+	}
 }
 
 func TestShellOverlayDLLIntegration(t *testing.T) {
