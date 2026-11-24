@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Build Windows Installer & Binaries
+    runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "${{ inputs.tag }}"
+          } else {
+            "${{ github.ref_name }}"
+          }
+          $ver = $tag.TrimStart("v")
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet and test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          go vet ./...
+          go test -count=1 ./...
+
+      - name: Ensure Inno Setup 6
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $found = (Get-Command "ISCC.exe" -ErrorAction SilentlyContinue) -or
+            (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -or
+            (Test-Path "$env:ProgramFiles\Inno Setup 6\ISCC.exe") -or
+            (Test-Path "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe")
+          if (-not $found) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build Windows Setup and portable binaries
+        shell: pwsh
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+
+          # 1. Windows GUI Setup installer (bundles telemount.exe + signed WinFsp MSI)
+          powershell -ExecutionPolicy Bypass -File .\scripts\build-installer.ps1 -Version $env:VERSION
+          Copy-Item .\dist\TeleMount-Setup.exe "release-assets\TeleMount-Setup-$($env:TAG)-windows-amd64.exe"
+          Copy-Item .\dist\telemount.exe "release-assets\telemount-$($env:TAG)-windows-amd64.exe"
+
+          # 2. Pure-Go static Linux binaries (amd64 + arm64)
+          $env:CGO_ENABLED = "0"
+          $env:GOOS = "linux"
+          foreach ($arch in @("amd64", "arm64")) {
+            $env:GOARCH = $arch
+            go build -trimpath -ldflags="-s -w" -o "release-assets\telemount-$($env:TAG)-linux-$arch" ./cmd/telemount
+            if ($LASTEXITCODE -ne 0) { throw "linux/$arch build failed" }
+          }
+
+          # 3. SHA-256 checksums
+          $lines = Get-ChildItem release-assets -File | Sort-Object Name | ForEach-Object {
+            $h = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$h  $($_.Name)"
+          }
+          [System.IO.File]::WriteAllLines((Resolve-Path release-assets).Path + "\SHA256SUMS.txt", $lines, (New-Object System.Text.UTF8Encoding($false)))
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          $assets = Get-ChildItem release-assets -File | Select-Object -ExpandProperty FullName
+          $ErrorActionPreference = "Continue"
+          gh release view $env:TAG *> $null
+          $exists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = "Stop"
+          if ($exists) {
+            gh release upload $env:TAG @assets --clobber
+          } else {
+            gh release create $env:TAG @assets --target $env:GITHUB_SHA --title "TeleMount $($env:TAG)" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "gh release failed with exit code $LASTEXITCODE" }
+
+  docker:
+    name: Build & Push Multi-Arch Docker Image (GHCR)
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push linux/amd64 + linux/arm64
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER_LOWER}/telemount"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --push \
+            -t "${IMAGE}:${TAG}" \
+            -t "${IMAGE}:latest" \
+            .

@@ -97,3 +97,17 @@ On the host, `./mnt` is backed by your encrypted Telegram storage with VFS write
 go test ./...
 go test -tags e2e ./e2e/...
 ```
+
+## Automated Releases (GitHub Actions)
+
+Push a version tag to build and publish **Windows Setup (`TeleMount-Setup-*.exe` with bundled WinFsp)**, portable Windows/Linux binaries, `SHA256SUMS.txt`, and multi-arch Docker images (`linux/amd64`, `linux/arm64`) on GHCR:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Prebuilt Docker image (for Portainer / VPS):
+```bash
+docker pull ghcr.io/h2yq2a2g/telemount:latest
+```
