@@ -1,0 +1,9 @@
+# Copy this file to rclone/rclone.conf and replace the password using:
+#   docker run --rm rclone/rclone obscure "YOUR_WEBDAV_PASSWORD"
+
+[telemount]
+type = webdav
+url = http://telemount:8080/dav/
+vendor = other
+user = rclone
+pass = REPLACE_WITH_OBSCURED_PASSWORD

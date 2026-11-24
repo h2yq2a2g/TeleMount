@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TeleMount</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="toast-container"></div>
+
+  <!-- LOGIN VIEW -->
+  <section id="view-login" class="center-screen hidden">
+    <div class="card auth-card">
+      <div class="brand">
+        <div class="logo-dot">TM</div>
+        <div>
+          <h1>TeleMount</h1>
+          <p class="muted">Đăng nhập bảng điều khiển quản trị</p>
+        </div>
+      </div>
+      <form id="form-login" class="stack">
+        <label>Tên đăng nhập Admin
+          <input type="text" id="login-user" autocomplete="username" required />
+        </label>
+        <label>Mật khẩu Web UI
+          <input type="password" id="login-pass" autocomplete="current-password" required />
+        </label>
+        <button type="submit" class="btn btn-primary">Đăng nhập</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- SETUP WIZARD VIEW -->
+  <section id="view-setup" class="center-screen hidden">
+    <div class="card wizard-card">
+      <div class="brand">
+        <div class="logo-dot">TM</div>
+        <div>
+          <h1>Khởi tạo TeleMount</h1>
+          <p class="muted">Thiết lập lần đầu — không cần mật khẩu hay key trong .env</p>
+        </div>
+      </div>
+
+      <div class="stepper" id="wizard-stepper">
+        <div class="step" data-step="admin">1. Admin Web UI</div>
+        <div class="step" data-step="telegram">2. Telegram</div>
+        <div class="step" data-step="channel">3. Channel</div>
+        <div class="step" data-step="key">4. Encryption Key</div>
+        <div class="step" data-step="webdav" id="wizard-step-pill-webdav">5. WebDAV</div>
+      </div>
+
+      <!-- Step 1: Admin Web UI -->
+      <div id="step-admin" class="wizard-step hidden">
+        <h2>Tạo tài khoản quản trị Web UI</h2>
+        <p class="muted">Tài khoản này chỉ dùng cho bảng điều khiển Web UI (tách biệt hoàn toàn với tài khoản WebDAV và Encryption Key).</p>
+        <form id="form-setup-admin" class="stack">
+          <label>Tên đăng nhập Admin
+            <input type="text" id="setup-admin-user" value="admin" minlength="2" required />
+          </label>
+          <label>Mật khẩu Web UI (tối thiểu 6 ký tự)
+            <input type="password" id="setup-admin-pass" minlength="6" required />
+          </label>
+          <label>Nhập lại mật khẩu
+            <input type="password" id="setup-admin-pass2" minlength="6" required />
+          </label>
+          <button type="submit" class="btn btn-primary">Tạo Admin &amp; Tiếp tục</button>
+        </form>
+      </div>
+
+      <!-- Step 2: Telegram -->
+      <div id="step-telegram" class="wizard-step hidden">
+        <h2>Kết nối tài khoản Telegram (MTProto)</h2>
+        <p class="muted">Lấy <code>api_id</code> và <code>api_hash</code> miễn phí tại <a href="https://my.telegram.org/apps" target="_blank" rel="noreferrer">my.telegram.org/apps</a>.</p>
+        <form id="form-tg-api" class="stack">
+          <div class="row-2">
+            <label>API ID
+              <input type="number" id="tg-api-id" placeholder="12345678" required />
+            </label>
+            <label>API Hash
+              <input type="text" id="tg-api-hash" placeholder="0123456789abcdef..." required />
+            </label>
+          </div>
+          <button type="submit" class="btn btn-primary" id="btn-tg-connect">Kết nối MTProto</button>
+        </form>
+
+        <div id="tg-auth-box" class="sub-box hidden">
+          <div class="tabs-inline">
+            <button type="button" class="tab-pill active" data-auth-tab="qr">Quét mã QR</button>
+            <button type="button" class="tab-pill" data-auth-tab="phone">Số điện thoại &amp; OTP</button>
+          </div>
+
+          <div id="auth-pane-qr" class="stack center-col">
+            <p class="muted">Mở Telegram trên điện thoại → Settings → Devices → Link Desktop Device rồi quét mã:</p>
+            <div id="qr-holder" class="qr-box">
+              <span class="muted">Chưa tạo mã QR</span>
+            </div>
+            <button type="button" class="btn btn-secondary" id="btn-qr-start">Tạo / Làm mới mã QR</button>
+          </div>
+
+          <div id="auth-pane-phone" class="stack hidden">
+            <div class="row-inline">
+              <input type="text" id="tg-phone" placeholder="+84901234567" />
+              <button type="button" class="btn btn-secondary" id="btn-send-otp">Gửi mã OTP</button>
+            </div>
+            <div class="row-inline">
+              <input type="text" id="tg-otp" placeholder="Nhập mã OTP từ Telegram" />
+              <button type="button" class="btn btn-primary" id="btn-verify-otp">Xác nhận OTP</button>
+            </div>
+          </div>
+
+          <div id="auth-pane-2fa" class="stack hidden">
+            <div class="alert alert-info">Tài khoản bật xác thực 2 bước (Cloud Password). Vui lòng nhập mật khẩu 2FA:</div>
+            <div class="row-inline">
+              <input type="password" id="tg-2fa" placeholder="Mật khẩu 2FA Telegram" />
+              <button type="button" class="btn btn-primary" id="btn-verify-2fa">Xác nhận 2FA</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 3: Channel -->
+      <div id="step-channel" class="wizard-step hidden">
+        <h2>Chọn hoặc tạo Private Channel lưu trữ</h2>
+        <p class="muted">Toàn bộ blob mã hóa và bản backup DB sẽ được lưu gọn trong 1 Private Channel riêng.</p>
+        <div class="row-inline">
+          <input type="text" id="new-channel-title" placeholder="Tên Private Channel mới (vd: TeleMount Vault)" />
+          <button type="button" class="btn btn-primary" id="btn-create-channel">Tạo mới</button>
+        </div>
+        <div class="divider">Hoặc chọn Channel đã có (nếu muốn khôi phục dữ liệu cũ)</div>
+        <div id="channel-list" class="list-box">
+          <div class="muted">Đang tải danh sách channel...</div>
+        </div>
+        <button type="button" class="btn btn-ghost" id="btn-reload-channels">Tải lại danh sách</button>
+      </div>
+
+      <!-- Step 4: Encryption Key -->
+      <div id="step-key" class="wizard-step hidden">
+        <h2>Thiết lập Encryption Key</h2>
+        <p class="muted">Chuỗi anh nhập sẽ được băm qua <strong>Argon2id</strong> (kèm random salt) thành khóa 32-byte AES-256-GCM. App chỉ lưu khóa đã băm tại <code>/data/master.key</code>, không lưu chuỗi gốc.</p>
+
+        <div id="existing-backup-notice" class="alert alert-warn hidden"></div>
+
+        <div class="tabs-inline">
+          <button type="button" class="tab-pill active" data-key-tab="fresh">Tạo mới kho dữ liệu</button>
+          <button type="button" class="tab-pill" data-key-tab="restore">Khôi phục từ Channel cũ</button>
+        </div>
+
+        <div id="key-pane-fresh" class="stack">
+          <label>Nhập Encryption Key của anh (hoặc bấm tự sinh ngẫu nhiên)
+            <div class="row-inline">
+              <input type="text" id="fresh-key-input" placeholder="Nhập chuỗi bí mật bất kỳ..." autocomplete="off" />
+              <button type="button" class="btn btn-secondary" id="btn-gen-key">Sinh ngẫu nhiên</button>
+            </div>
+          </label>
+          <div class="row-inline">
+            <button type="button" class="btn btn-ghost" id="btn-copy-key">Copy key</button>
+            <button type="button" class="btn btn-ghost" id="btn-dl-key">Tải file .txt cất giữ</button>
+          </div>
+          <label class="checkbox-row">
+            <input type="checkbox" id="chk-saved-key" />
+            <span>Tôi đã lưu lại Encryption Key này (mất key sẽ không thể giải mã file và DB backup).</span>
+          </label>
+          <button type="button" class="btn btn-primary" id="btn-init-key">Khởi tạo khóa &amp; tạo DB backup đầu tiên</button>
+        </div>
+
+        <div id="key-pane-restore" class="stack hidden">
+          <label>Chọn bản backup DB trên Channel
+            <select id="restore-backup-select"></select>
+          </label>
+          <label>Nhập lại Encryption Key cũ
+            <input type="password" id="restore-key-input" placeholder="Nhập đúng Encryption Key đã dùng trước đó" />
+          </label>
+          <button type="button" class="btn btn-primary" id="btn-restore-key">Giải mã &amp; Khôi phục dữ liệu</button>
+        </div>
+      </div>
+
+      <!-- Step 5: WebDAV Credentials (Server / Portainer mode only) -->
+      <div id="step-webdav" class="wizard-step hidden">
+        <h2>Tạo tài khoản WebDAV riêng (cho rclone)</h2>
+        <p class="muted">Dùng riêng cho endpoint <code>/dav/</code> và container <code>rclone</code>, tách biệt khỏi mật khẩu Web UI.</p>
+        <form id="form-setup-webdav" class="stack">
+          <label>WebDAV Username
+            <input type="text" id="setup-dav-user" value="rclone" minlength="2" required />
+          </label>
+          <label>WebDAV Password
+            <div class="row-inline">
+              <input type="text" id="setup-dav-pass" minlength="4" required />
+              <button type="button" class="btn btn-secondary" id="btn-gen-dav-pass">Sinh mật khẩu</button>
+            </div>
+          </label>
+          <button type="submit" class="btn btn-primary">Hoàn tất cài đặt</button>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <!-- MAIN CONTROL PANEL SHELL -->
+  <div id="view-app" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo-dot">TM</div>
+        <div>
+          <strong>TeleMount</strong>
+          <div class="muted small" id="sidebar-channel">—</div>
+        </div>
+      </div>
+      <nav class="nav-list">
+        <button class="nav-item active" data-nav="dashboard">📊 Tổng quan &amp; Ops</button>
+        <button class="nav-item" data-nav="settings">⚙️ Cài đặt</button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="status-pill" id="tg-status-pill">● Đang kết nối...</div>
+        <button class="btn btn-ghost small-btn" id="btn-logout">Đăng xuất</button>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <!-- DASHBOARD & OPS PAGE -->
+      <section id="page-dashboard" class="page">
+        <header class="page-header">
+          <h2 id="dash-title">Tổng quan &amp; Vận hành</h2>
+          <button class="btn btn-secondary" id="btn-refresh-dash">Làm mới</button>
+        </header>
+
+        <!-- Desktop WinFsp Warning Banner -->
+        <div id="desktop-winfsp-banner" class="alert alert-warn hidden">
+          <div class="banner-title">⚠️ Thiếu WinFsp — Chưa thể gắn ổ đĩa ảo (Virtual Drive)</div>
+          <div id="desktop-winfsp-guidance" class="small" style="margin-bottom:8px"></div>
+          <div class="row-inline" style="flex-wrap:wrap">
+            <a class="btn btn-secondary small-btn" href="https://winfsp.dev/rel/" target="_blank" rel="noreferrer">Tải từ winfsp.dev</a>
+            <code id="winget-winfsp-cmd">winget install WinFsp.WinFsp</code>
+            <button type="button" class="btn btn-secondary small-btn" id="btn-copy-winget">Copy lệnh winget</button>
+          </div>
+        </div>
+
+        <!-- Desktop Virtual Drive Control Card -->
+        <div id="desktop-drive-card" class="card hidden">
+          <div class="row-between" style="flex-wrap:wrap">
+            <div>
+              <h3 style="margin-bottom:4px">Ổ đĩa ảo Windows (Virtual Drive)</h3>
+              <div class="small">
+                Ổ đĩa <strong id="desktop-drive-letter">V:</strong> ·
+                <span class="status-pill" id="desktop-mount-badge">—</span>
+                <span class="muted small" id="desktop-startup-badge"></span>
+              </div>
+            </div>
+            <div class="row-inline">
+              <button type="button" class="btn btn-primary" id="btn-desktop-mount">Gắn ổ đĩa (Mount)</button>
+              <button type="button" class="btn btn-secondary" id="btn-desktop-unmount">Ngắt ổ đĩa (Unmount)</button>
+              <button type="button" class="btn btn-secondary" id="btn-desktop-open">Mở ổ đĩa</button>
+            </div>
+          </div>
+          <div id="desktop-mount-error" class="alert alert-err hidden" style="margin-top:10px;margin-bottom:0"></div>
+        </div>
+
+        <!-- Desktop Offline Write Queue & Persistent Disk Cache -->
+        <div id="desktop-sync-grid" class="grid-2 hidden">
+          <div id="desktop-queue-card" class="card">
+            <div class="row-between" style="margin-bottom:8px">
+              <h3 style="margin:0">Hàng đợi ghi Offline (Offline Write Queue)</h3>
+              <span class="status-pill" id="desktop-queue-state">—</span>
+            </div>
+            <p class="muted small" id="desktop-queue-summary" style="margin:0 0 10px">Chờ đồng bộ: 0 tác vụ (0 B)</p>
+            <div id="desktop-queue-error" class="alert alert-err hidden"></div>
+            <div class="row-inline">
+              <button type="button" class="btn btn-secondary" id="btn-desktop-flush-queue">Đẩy hàng đợi ngay (Flush Queue)</button>
+            </div>
+          </div>
+
+          <div id="desktop-cache-card" class="card">
+            <div class="row-between" style="margin-bottom:8px">
+              <h3 style="margin:0">Bộ đệm đĩa cục bộ (Persistent Disk Cache)</h3>
+              <button type="button" class="btn btn-secondary small-btn" id="btn-desktop-clear-cache">Xóa cache chưa ghim</button>
+            </div>
+            <div class="kpi-val" id="desktop-disk-cache-usage">0 B / 10 GB</div>
+            <div class="progress-track"><div class="progress-fill" id="desktop-disk-cache-bar" style="width:0%"></div></div>
+            <p class="muted small" id="desktop-disk-cache-meta" style="margin:8px 0 0">Đã ghim (Pinned): 0 B · 0 mục</p>
+          </div>
+        </div>
+
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="muted small">Dung lượng dữ liệu gốc</div>
+            <div class="kpi-val" id="kpi-size">0 B</div>
+            <div class="muted small" id="kpi-parts">Mã hóa: 0 B (0 parts)</div>
+          </div>
+          <div class="kpi-card">
+            <div class="muted small">Số lượng lưu trữ</div>
+            <div class="kpi-val" id="kpi-files">0 tệp</div>
+            <div class="muted small" id="kpi-folders">0 thư mục</div>
+          </div>
+          <div class="kpi-card">
+            <div class="muted small">Bộ đệm RAM Cache</div>
+            <div class="kpi-val" id="kpi-cache">0 / 2048 MB</div>
+            <div class="row-between">
+              <span class="muted small" id="kpi-cache-hit">Hit: 0%</span>
+              <button class="link-btn" id="btn-clear-cache">Xóa cache</button>
+            </div>
+          </div>
+          <div class="kpi-card">
+            <div class="muted small">Telegram &amp; Tiến trình</div>
+            <div class="kpi-val" id="kpi-tg">—</div>
+            <div class="muted small" id="kpi-mem">Go RAM: 0 MB</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="row-between">
+            <div>
+              <h3>Hybrid Pack (gom file nhỏ kiểu Duplicati trên RAM)</h3>
+              <p class="muted small" id="pack-summary-line">Đang chờ trong RAM: 0 tệp (0 B) · Đã lưu: 0 packs</p>
+            </div>
+            <div class="row-inline">
+              <button class="btn btn-secondary" id="btn-flush-pack">Đẩy Pack ngay</button>
+              <button class="btn btn-primary" id="btn-compact-packs">Compact Packs</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3>Luồng Upload / Download đang chạy</h3>
+            <div id="active-transfers" class="stack muted small">Không có luồng nào đang chạy.</div>
+          </div>
+          <div class="card">
+            <h3>Sự kiện Telegram FloodWait gần đây</h3>
+            <div id="flood-events" class="stack muted small">Chưa ghi nhận FloodWait.</div>
+          </div>
+        </div>
+
+        <div class="card" id="card-rclone-config">
+          <div class="row-between">
+            <h3>Cấu hình rclone (WebDAV + RAM tmpfs)</h3>
+            <button class="btn btn-ghost small-btn" id="btn-copy-rclone">Copy rclone.conf</button>
+          </div>
+          <p class="muted small">Endpoint nội bộ Docker: <code id="rclone-int-url"></code> &nbsp;|&nbsp; Endpoint ngoài: <code id="rclone-ext-url"></code></p>
+          <pre class="code-box" id="rclone-conf-box"></pre>
+          <p class="muted small">Lệnh mẫu mount dùng RAM cache (<code>/cache</code> gắn <code>tmpfs</code>):</p>
+          <pre class="code-box" id="rclone-mount-box"></pre>
+        </div>
+
+        <div class="card">
+          <div class="row-between">
+            <div>
+              <h3>Quét &amp; dọn blob mồ côi trên Telegram Channel</h3>
+              <p class="muted small">Tìm các file <code>.bin</code> trên channel không còn nằm trong DB (bỏ qua các bản backup <code>.tmdb</code>).</p>
+            </div>
+            <div class="row-inline">
+              <button class="btn btn-secondary" id="btn-scan-orphans">Quét channel</button>
+              <button class="btn btn-danger hidden" id="btn-clean-orphans">Xóa tất cả blob thừa</button>
+            </div>
+          </div>
+          <div id="orphan-result" class="muted small">Chưa quét.</div>
+        </div>
+      </section>
+
+      <!-- SETTINGS PAGE -->
+      <section id="page-settings" class="page hidden">
+        <header class="page-header">
+          <h2>Cài đặt hệ thống</h2>
+        </header>
+
+        <div class="card">
+          <div class="row-between">
+            <div>
+              <h3>Đa tài khoản Telegram Backup (Server-Side Mirror)</h3>
+              <p class="muted small">Đăng nhập thêm 1 hoặc nhiều nick phụ: tự động tạo Private Channel riêng cho từng nick và nhân bản mọi Pack/file + DB backup trên mây Telegram (0 MB băng thông server, tự đọc dự phòng khi nick chính lỗi).</p>
+            </div>
+            <div class="row-inline">
+              <button type="button" class="btn btn-secondary" id="btn-sync-accounts">Đồng bộ tất cả</button>
+              <button type="button" class="btn btn-primary" id="btn-add-backup-acc">+ Thêm nick Backup</button>
+            </div>
+          </div>
+          <div id="accounts-box" class="stack" style="margin-top:12px">
+            <div class="muted small">Đang tải danh sách tài khoản...</div>
+          </div>
+        </div>
+
+        <div id="desktop-settings-card" class="card hidden">
+          <h3>Cài đặt Windows Desktop &amp; Ổ đĩa ảo</h3>
+          <div id="desktop-settings-err" class="alert alert-err hidden"></div>
+          <form id="form-desktop-settings" class="stack">
+            <div class="row-2">
+              <label>Chữ cái ổ đĩa (Drive Letter, vd: V:)
+                <input type="text" id="set-desktop-drive" placeholder="V:" maxlength="3" required />
+              </label>
+              <label>Giới hạn Disk Cache (mặc định 10 GB)
+                <div class="row-inline">
+                  <input type="number" id="set-desktop-cache-val" min="1" step="any" required />
+                  <select id="set-desktop-cache-unit" class="unit-select">
+                    <option value="GB">GB</option>
+                    <option value="MB">MB</option>
+                  </select>
+                </div>
+              </label>
+            </div>
+            <label>Đường dẫn ghim ngoại tuyến (Pinned Offline Paths — mỗi dòng 1 đường dẫn, vd: /Documents)
+              <textarea id="set-desktop-pinned" rows="4" placeholder="/Documents&#10;/Work/spec.pdf"></textarea>
+            </label>
+            <label class="checkbox-row">
+              <input type="checkbox" id="set-desktop-startup" />
+              <span>Tự khởi động cùng Windows (Run at Windows startup)</span>
+            </label>
+            <label class="checkbox-row">
+              <input type="checkbox" id="set-desktop-automount" />
+              <span>Tự động gắn ổ đĩa ảo khi khởi động (Auto-mount)</span>
+            </label>
+            <div>
+              <button type="submit" class="btn btn-primary" id="btn-save-desktop-settings">Lưu cài đặt Desktop</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3>Lưu trữ, Hybrid Pack &amp; Bộ nhớ RAM</h3>
+            <form id="form-settings" class="stack">
+              <div class="row-2">
+                <label>Ngưỡng file nhỏ gom Pack (MB, mặc định 128, 0 = tắt)
+                  <input type="number" id="set-small-mb" min="0" max="1024" required />
+                </label>
+                <label>Kích thước tối đa 1 Pack (MB, mặc định 1024 = 1GB)
+                  <input type="number" id="set-pack-mb" min="16" max="1950" required />
+                </label>
+              </div>
+              <div class="row-2">
+                <label>Thời gian nghỉ tự đẩy Pack (giây, mặc định 10s)
+                  <input type="number" id="set-pack-idle" min="1" max="3600" required />
+                </label>
+                <label>Chia part file lớn ≥ ngưỡng (MB, mặc định 1024 = 1GB)
+                  <input type="number" id="set-part-mb" min="10" max="1950" required />
+                </label>
+              </div>
+              <div class="row-2">
+                <label>Bộ đệm đọc RAM Cache (MB, mặc định 2048)
+                  <input type="number" id="set-cache-mb" min="16" max="65536" required />
+                </label>
+                <label>Số luồng upload MTProto song song (1–16)
+                  <input type="number" id="set-threads" min="1" max="16" required />
+                </label>
+              </div>
+              <label>Chu kỳ tự động backup DB mã hóa lên Telegram (phút, 0 = tắt tự động)
+                <input type="number" id="set-backup-min" min="0" max="10080" required />
+              </label>
+              <button type="submit" class="btn btn-primary">Lưu &amp; áp dụng ngay</button>
+            </form>
+          </div>
+
+          <div class="card">
+            <h3>Sao lưu &amp; Khôi phục DB lên Telegram</h3>
+            <p class="muted small">Snapshot SQLite được tạo trong <code>/tmp</code> (RAM tmpfs), nén &amp; mã hóa bằng Argon2id + AES-256-GCM rồi đẩy lên Channel.</p>
+            <div class="row-inline">
+              <button class="btn btn-primary" id="btn-backup-now">Backup DB ngay</button>
+              <button class="btn btn-secondary" id="btn-load-backups">Xem danh sách backup</button>
+            </div>
+            <div class="muted small" id="last-backup-info"></div>
+            <div id="backup-list" class="list-box"></div>
+            <div class="divider">Khôi phục bản backup đã chọn</div>
+            <div class="stack">
+              <select id="settings-restore-select"></select>
+              <input type="password" id="settings-restore-key" placeholder="Nhập Encryption Key để xác nhận khôi phục" />
+              <button type="button" class="btn btn-danger" id="btn-settings-restore">Khôi phục DB</button>
+            </div>
+          </div>
+
+          <div class="card" id="card-webdav-settings">
+            <h3>Tài khoản WebDAV (rclone)</h3>
+            <form id="form-set-webdav" class="stack">
+              <label>WebDAV Username
+                <input type="text" id="set-dav-user" minlength="2" required />
+              </label>
+              <label>WebDAV Password mới
+                <input type="password" id="set-dav-pass" minlength="4" required />
+              </label>
+              <button type="submit" class="btn btn-primary">Cập nhật tài khoản WebDAV</button>
+            </form>
+          </div>
+
+          <div class="card">
+            <h3>Đổi mật khẩu Admin Web UI</h3>
+            <form id="form-set-admin-pass" class="stack">
+              <label>Mật khẩu hiện tại
+                <input type="password" id="cur-admin-pass" required />
+              </label>
+              <label>Tên đăng nhập mới (để trống nếu giữ nguyên)
+                <input type="text" id="new-admin-user" />
+              </label>
+              <label>Mật khẩu Web UI mới (tối thiểu 6 ký tự)
+                <input type="password" id="new-admin-pass" minlength="6" required />
+              </label>
+              <button type="submit" class="btn btn-primary">Đổi mật khẩu Web UI</button>
+            </form>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- MODAL FOR ADDING BACKUP TELEGRAM ACCOUNT -->
+  <div id="backup-acc-modal" class="modal-backdrop hidden">
+    <div class="card modal-card" style="max-width:480px">
+      <div class="row-between">
+        <h3 style="margin:0">Thêm tài khoản Telegram Backup</h3>
+        <button type="button" class="btn btn-ghost small-btn" id="btn-close-bacc-modal">Đóng</button>
+      </div>
+      <p class="muted small" style="margin:8px 0 12px">Dùng một tài khoản Telegram khác với tài khoản chính. Sau khi đăng nhập, hệ thống tự tạo Private Channel riêng và đồng bộ toàn bộ dữ liệu sang.</p>
+
+      <div class="tabs-inline">
+        <button type="button" class="tab-pill active" data-bacc-tab="qr">Quét mã QR</button>
+        <button type="button" class="tab-pill" data-bacc-tab="phone">Số điện thoại &amp; OTP</button>
+      </div>
+
+      <div id="bacc-pane-qr" class="stack center-col">
+        <div id="bacc-qr-holder" class="qr-box">
+          <span class="muted">Đang khởi tạo phiên...</span>
+        </div>
+        <button type="button" class="btn btn-secondary" id="btn-bacc-qr-refresh">Làm mới mã QR</button>
+      </div>
+
+      <div id="bacc-pane-phone" class="stack hidden">
+        <div class="row-inline">
+          <input type="text" id="bacc-phone" placeholder="+84901234567" />
+          <button type="button" class="btn btn-secondary" id="btn-bacc-send-otp">Gửi OTP</button>
+        </div>
+        <div class="row-inline">
+          <input type="text" id="bacc-otp" placeholder="Nhập mã OTP" />
+          <button type="button" class="btn btn-primary" id="btn-bacc-verify-otp">Xác nhận OTP</button>
+        </div>
+      </div>
+
+      <div id="bacc-pane-2fa" class="stack hidden" style="margin-top:10px">
+        <div class="alert alert-info">Nhập mật khẩu 2FA (Cloud Password) của nick Backup:</div>
+        <div class="row-inline">
+          <input type="password" id="bacc-2fa" placeholder="Mật khẩu 2FA" />
+          <button type="button" class="btn btn-primary" id="btn-bacc-verify-2fa">Xác nhận 2FA</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

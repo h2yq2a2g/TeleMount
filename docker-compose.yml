@@ -1,0 +1,66 @@
+services:
+  telemount:
+    build: .
+    container_name: telemount
+    restart: unless-stopped
+    # Expose to localhost for Nginx/Caddy/Traefik/Cloudflare Tunnel.
+    # Change to "8080:8080" if accessing directly on LAN.
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      LISTEN_ADDR: ":8080"
+      DATA_DIR: "/data"
+      TMP_DIR: "/tmp/telemount"
+      # Optional: tune Go GC soft memory ceiling to fit your RAM cache setting on Web UI.
+      # GOMEMLIMIT: "2600MiB"
+    volumes:
+      # Only lightweight metadata (SQLite DB, state.json, master.key, tg_session.json)
+      - ./data:/data
+    tmpfs:
+      # RAM-only scratch space for DB backup snapshots and unknown-length WebDAV streams (0 SSD wear)
+      - /tmp:rw,noexec,nosuid,size=2G
+    networks:
+      - telemount-net
+
+  # Separate rclone container — opt-in via: docker compose --profile rclone up -d
+  # Finish the Web UI setup wizard first, then create ./rclone/rclone.conf from rclone.conf.example.
+  rclone:
+    image: rclone/rclone:latest
+    container_name: telemount-rclone
+    profiles: ["rclone"]
+    restart: unless-stopped
+    depends_on:
+      telemount:
+        condition: service_healthy
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse:/dev/fuse:rwm
+    security_opt:
+      - apparmor:unconfined
+    tmpfs:
+      # Keep rclone VFS cache purely in RAM so mounting never wears out your SSD
+      - /cache:rw,nosuid,nodev,size=2G
+    volumes:
+      - ./rclone/rclone.conf:/config/rclone/rclone.conf:ro
+      - type: bind
+        source: ./mnt
+        target: /mnt/telemount
+        bind:
+          propagation: rshared
+    command:
+      - mount
+      - telemount:
+      - /mnt/telemount
+      - --cache-dir=/cache
+      - --vfs-cache-mode=writes
+      - --vfs-cache-max-size=1800M
+      - --vfs-cache-max-age=5m
+      - --dir-cache-time=30s
+      - --allow-other
+    networks:
+      - telemount-net
+
+networks:
+  telemount-net:
+    driver: bridge

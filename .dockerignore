@@ -1,0 +1,11 @@
+.git
+data
+dist
+mnt
+rclone
+*.exe
+*.msi
+*.db
+*.db-wal
+*.db-shm
+README.md

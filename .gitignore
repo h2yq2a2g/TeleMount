@@ -1,0 +1,14 @@
+# Runtime data & mounts
+/data/
+/mnt/
+rclone/rclone.conf
+
+# Binaries & build artifacts
+/telemount
+/telemount.exe
+/dist/
+*.msi
+*.db
+*.db-wal
+*.db-shm
+*.log

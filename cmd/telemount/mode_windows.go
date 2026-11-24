@@ -1,0 +1,463 @@
+//go:build windows
+
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
+
+	"telemount/internal/db"
+	"telemount/internal/desktop"
+	"telemount/internal/diskcache"
+	"telemount/internal/state"
+	"telemount/internal/storage"
+	"telemount/internal/tg"
+	"telemount/internal/tray"
+	"telemount/internal/vfs"
+	"telemount/internal/web"
+)
+
+func defaultRuntimePaths() (dataDir, tmpDir, listenAddr string) {
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			base = filepath.Join(home, "AppData", "Local")
+		} else {
+			base = "."
+		}
+	}
+	root := filepath.Join(base, "TeleMount")
+	return root, filepath.Join(root, "tmp"), desktop.DefaultWebAddr
+}
+
+func runPlatform(
+	appCtx context.Context,
+	appCancel context.CancelFunc,
+	dataDir, listenAddr string,
+	headless, minimized bool,
+	store *db.Store,
+	st *state.Manager,
+	tgMgr *tg.Manager,
+	engine *storage.Engine,
+	srv *web.Server,
+) {
+	if headless {
+		runHeadlessWindows(appCancel, dataDir, listenAddr, engine, srv)
+		return
+	}
+
+	cfgStore, err := desktop.LoadConfig("", dataDir)
+	if err != nil {
+		log.Fatalf("load desktop config: %v", err)
+	}
+	cfg := cfgStore.Get()
+
+	// Respect LISTEN_ADDR env override if explicitly set; otherwise use persisted WebAddr (default 127.0.0.1:8080).
+	bindAddr := cfg.WebAddr
+	if os.Getenv("LISTEN_ADDR") != "" {
+		bindAddr = listenAddr
+	}
+
+	cache, err := diskcache.Open(
+		cfg.DiskCacheDir,
+		filepath.Join(dataDir, "desktop_cache.db"),
+		cfg.DiskCacheMaxBytes,
+		store,
+		engine,
+	)
+	if err != nil {
+		log.Fatalf("open persistent disk cache: %v", err)
+	}
+	defer cache.Close()
+
+	if len(cfg.PinnedPaths) > 0 {
+		_ = cache.SetPinnedPaths(cfg.PinnedPaths)
+	}
+	cache.StartSyncLoop(appCtx, 5*time.Second)
+
+	exePath, _ := os.Executable()
+	probe := desktop.NewWinFspProbe()
+	driveChecker := desktop.NewDriveChecker()
+	startupMgr := desktop.NewStartupManager(nil, "TeleMount")
+
+	tfs := vfs.NewTeleFS(store, cache)
+	mountMgr := vfs.NewMountManager(tfs, probe, driveChecker)
+
+	ln, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		// Fall back to an ephemeral loopback port if default 127.0.0.1:8080 is already taken.
+		ln, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			log.Fatalf("listen loopback web ui: %v", err)
+		}
+	}
+	webURL := "http://" + ln.Addr().String()
+
+	httpSrv := &http.Server{
+		Handler:           srv,
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+
+	rt := &desktopRuntime{
+		appCancel:    appCancel,
+		exePath:      exePath,
+		webURL:       webURL,
+		cfgStore:     cfgStore,
+		cache:        cache,
+		mountMgr:     mountMgr,
+		probe:        probe,
+		driveChecker: driveChecker,
+		startupMgr:   startupMgr,
+		engine:       engine,
+		tgMgr:        tgMgr,
+		httpSrv:      httpSrv,
+	}
+	srv.SetDesktopController(rt)
+
+	trayApp, err := tray.New(&trayActionsAdapter{rt: rt})
+	if err != nil {
+		log.Fatalf("init system tray: %v", err)
+	}
+	rt.setTray(trayApp)
+
+	go func() {
+		log.Printf("TeleMount desktop listening on %s (data: %s, cache: %s)", webURL, dataDir, cfg.DiskCacheDir)
+		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("http server error: %v", err)
+		}
+	}()
+
+	// Handle OS termination signals gracefully alongside Tray Quit.
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		select {
+		case <-sigCh:
+			rt.Quit()
+			_ = trayApp.Close()
+		case <-appCtx.Done():
+		}
+	}()
+
+	// Post-startup mount, WinFsp probe notification, and initial Web UI launch.
+	go func() {
+		time.Sleep(350 * time.Millisecond)
+		stTray := rt.TrayStatus()
+		if !tray.CheckAndNotifyWinFsp(stTray, trayApp) {
+			log.Printf("WinFsp not installed: %s", stTray.WinFspGuidance)
+		} else if cfgStore.Get().AutoMount {
+			if err := rt.Mount(); err != nil {
+				log.Printf("auto-mount warning: %v", err)
+			}
+		}
+		_ = trayApp.Refresh()
+
+		if !minimized && !st.Snapshot().SetupCompleted {
+			_ = rt.OpenWebUI()
+		}
+
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-appCtx.Done():
+				return
+			case <-ticker.C:
+				_ = trayApp.Refresh()
+			}
+		}
+	}()
+
+	if err := trayApp.Run(appCtx); err != nil {
+		log.Printf("system tray exited with error: %v", err)
+	}
+	rt.shutdownOnce()
+}
+
+func runHeadlessWindows(
+	appCancel context.CancelFunc,
+	dataDir, listenAddr string,
+	engine *storage.Engine,
+	srv *web.Server,
+) {
+	httpSrv := &http.Server{
+		Addr:              listenAddr,
+		Handler:           srv,
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		shutCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutCtx)
+		if engine.IsReady() {
+			_ = engine.Packer().FlushNow(shutCtx)
+		}
+		appCancel()
+	}()
+
+	log.Printf("TeleMount headless listening on %s (Web UI: /, WebDAV: /dav/, data: %s)", listenAddr, dataDir)
+	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("http server: %v", err)
+	}
+}
+
+type desktopRuntime struct {
+	appCancel    context.CancelFunc
+	exePath      string
+	webURL       string
+	cfgStore     *desktop.ConfigStore
+	cache        *diskcache.Manager
+	mountMgr     *vfs.MountManager
+	probe        desktop.WinFspProbe
+	driveChecker desktop.DriveChecker
+	startupMgr   *desktop.StartupManager
+	engine       *storage.Engine
+	tgMgr        *tg.Manager
+	httpSrv      *http.Server
+
+	trayMu       sync.RWMutex
+	trayApp      *tray.App
+	quitOnce     sync.Once
+}
+
+func (r *desktopRuntime) setTray(app *tray.App) {
+	r.trayMu.Lock()
+	r.trayApp = app
+	r.trayMu.Unlock()
+}
+
+func (r *desktopRuntime) refreshTray() {
+	r.trayMu.RLock()
+	app := r.trayApp
+	r.trayMu.RUnlock()
+	if app != nil {
+		_ = app.Refresh()
+	}
+}
+
+// web.DesktopController implementation:
+func (r *desktopRuntime) Status() web.DesktopStatus {
+	cfg := r.cfgStore.Get()
+	wf := r.probe.Check()
+	mounted, activeDrive, mountErr := r.mountMgr.Status()
+	drive := cfg.DriveLetter
+	if mounted && activeDrive != "" {
+		drive = activeDrive
+	}
+	cs := r.cache.Stats()
+	qs := r.cache.QueueStatus()
+	runAtStartup := cfg.RunAtStartup
+	if enabled, err := r.startupMgr.IsEnabled(); err == nil {
+		runAtStartup = enabled
+	}
+
+	return web.DesktopStatus{
+		Enabled:              true,
+		WinFspInstalled:      wf.Installed,
+		WinFspGuidance:       wf.Guidance,
+		DriveLetter:          drive,
+		Mounted:              mounted,
+		MountError:           mountErr,
+		RunAtStartup:         runAtStartup,
+		AutoMount:            cfg.AutoMount,
+		DiskCacheMaxBytes:    cfg.DiskCacheMaxBytes,
+		DiskCacheBytes:       cs.TotalBytes,
+		DiskCachePinnedBytes: cs.PinnedBytes,
+		DiskCacheEntries:     cs.EntryCount,
+		PinnedPaths:          r.cache.PinnedPaths(),
+		QueuePendingCount:    qs.PendingCount,
+		QueuePendingBytes:    qs.PendingBytes,
+		QueueSyncing:         qs.Syncing,
+		QueueLastError:       qs.LastError,
+	}
+}
+
+func (r *desktopRuntime) UpdateSettings(u web.DesktopSettingsUpdate) (web.DesktopStatus, error) {
+	wasMounted, oldDrive, _ := r.mountMgr.Status()
+	oldCfg := r.cfgStore.Get()
+
+	updated, err := r.cfgStore.Update(func(c *desktop.Config) error {
+		if u.DriveLetter != nil {
+			norm, err := desktop.NormalizeDriveLetter(*u.DriveLetter)
+			if err != nil {
+				return err
+			}
+			if !wasMounted || norm != oldDrive {
+				inUse, err := r.driveChecker.IsDriveInUse(norm)
+				if err != nil {
+					return err
+				}
+				if inUse {
+					return fmt.Errorf("drive letter %s is already in use", norm)
+				}
+			}
+			c.DriveLetter = norm
+		}
+		if u.DiskCacheMaxBytes != nil {
+			c.DiskCacheMaxBytes = *u.DiskCacheMaxBytes
+		}
+		if u.PinnedPaths != nil {
+			c.PinnedPaths = append([]string(nil), (*u.PinnedPaths)...)
+		}
+		if u.RunAtStartup != nil {
+			c.RunAtStartup = *u.RunAtStartup
+		}
+		if u.AutoMount != nil {
+			c.AutoMount = *u.AutoMount
+		}
+		return desktop.ValidateConfig(*c)
+	})
+	if err != nil {
+		return r.Status(), err
+	}
+
+	if u.DiskCacheMaxBytes != nil {
+		if err := r.cache.SetMaxBytes(updated.DiskCacheMaxBytes); err != nil {
+			return r.Status(), err
+		}
+	}
+
+	if u.PinnedPaths != nil {
+		if err := r.cache.SetPinnedPaths(updated.PinnedPaths); err != nil {
+			return r.Status(), err
+		}
+		if r.engine.IsReady() {
+			go func(paths []string) {
+				for _, p := range paths {
+					_ = r.cache.PinSync(context.Background(), p)
+				}
+			}(append([]string(nil), updated.PinnedPaths...))
+		}
+	}
+
+	if u.RunAtStartup != nil {
+		if *u.RunAtStartup {
+			if err := r.startupMgr.Enable(r.exePath, "--minimized"); err != nil {
+				return r.Status(), err
+			}
+		} else {
+			if err := r.startupMgr.Disable(); err != nil {
+				return r.Status(), err
+			}
+		}
+	}
+
+	// If drive letter changed while mounted, cleanly remount on the new drive letter.
+	if u.DriveLetter != nil && wasMounted && updated.DriveLetter != oldCfg.DriveLetter {
+		_ = r.mountMgr.Unmount(context.Background())
+		if err := r.mountMgr.Mount(updated.DriveLetter); err != nil {
+			return r.Status(), err
+		}
+	}
+
+	r.refreshTray()
+	return r.Status(), nil
+}
+
+func (r *desktopRuntime) Mount() error {
+	drv := r.cfgStore.Get().DriveLetter
+	err := r.mountMgr.Mount(drv)
+	r.refreshTray()
+	return err
+}
+
+func (r *desktopRuntime) Unmount() error {
+	err := r.mountMgr.Unmount(context.Background())
+	r.refreshTray()
+	return err
+}
+
+func (r *desktopRuntime) OpenDrive() error {
+	mounted, drv, _ := r.mountMgr.Status()
+	if !mounted {
+		return errors.New("ổ đĩa ảo chưa được mount")
+	}
+	return tray.OpenDrivePath(drv)
+}
+
+func (r *desktopRuntime) FlushQueue(ctx context.Context) error {
+	err := r.cache.FlushQueue(ctx)
+	if err == nil && r.engine.IsReady() {
+		_ = r.engine.Packer().FlushNow(ctx)
+	}
+	r.refreshTray()
+	return err
+}
+
+func (r *desktopRuntime) ClearUnpinnedCache() error {
+	err := r.cache.ClearUnpinned()
+	r.refreshTray()
+	return err
+}
+
+// tray.TrayActions implementation (reuses Mount/Unmount/OpenDrive above):
+func (r *desktopRuntime) TrayStatus() tray.TrayStatus {
+	st := r.Status()
+	return tray.TrayStatus{
+		Mounted:         st.Mounted,
+		DriveLetter:     st.DriveLetter,
+		WinFspInstalled: st.WinFspInstalled,
+		WinFspGuidance:  st.WinFspGuidance,
+		RunAtStartup:    st.RunAtStartup,
+		QueuePending:    st.QueuePendingCount,
+		Online:          r.engine.IsReady(),
+	}
+}
+
+func (r *desktopRuntime) OpenWebUI() error {
+	return tray.OpenBrowserURL(r.webURL)
+}
+
+func (r *desktopRuntime) ToggleStartup() (bool, error) {
+	cur := r.Status().RunAtStartup
+	next := !cur
+	st, err := r.UpdateSettings(web.DesktopSettingsUpdate{RunAtStartup: &next})
+	return st.RunAtStartup, err
+}
+
+func (r *desktopRuntime) Quit() {
+	r.shutdownOnce()
+}
+
+func (r *desktopRuntime) shutdownOnce() {
+	r.quitOnce.Do(func() {
+		log.Println("shutting down TeleMount desktop (unmounting drive and flushing pending writes)...")
+		shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = r.mountMgr.Unmount(shutCtx)
+		if r.engine.IsReady() {
+			_ = r.cache.FlushQueue(shutCtx)
+			_ = r.engine.Packer().FlushNow(shutCtx)
+		}
+		_ = r.httpSrv.Shutdown(shutCtx)
+		r.appCancel()
+	})
+}
+
+// Adapter so desktopRuntime can satisfy both web.DesktopController (Status() web.DesktopStatus)
+// and tray.TrayActions (Status() tray.TrayStatus).
+type trayActionsAdapter struct {
+	rt *desktopRuntime
+}
+
+func (a *trayActionsAdapter) Status() tray.TrayStatus      { return a.rt.TrayStatus() }
+func (a *trayActionsAdapter) Mount() error                 { return a.rt.Mount() }
+func (a *trayActionsAdapter) Unmount() error               { return a.rt.Unmount() }
+func (a *trayActionsAdapter) OpenDrive() error             { return a.rt.OpenDrive() }
+func (a *trayActionsAdapter) OpenWebUI() error             { return a.rt.OpenWebUI() }
+func (a *trayActionsAdapter) ToggleStartup() (bool, error) { return a.rt.ToggleStartup() }
+func (a *trayActionsAdapter) Quit()                        { a.rt.Quit() }
