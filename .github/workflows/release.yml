@@ -19,6 +19,9 @@ jobs:
   release:
     name: Build Windows Installer & Binaries
     runs-on: windows-latest
+    env:
+      # cgofuse uses pure-Go syscall backend on Windows only when CGO_ENABLED=0.
+      CGO_ENABLED: "0"
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
     steps:
