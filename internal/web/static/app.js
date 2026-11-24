@@ -342,18 +342,22 @@ document.querySelectorAll('[data-key-tab]').forEach((btn) => {
     document.querySelectorAll('[data-key-tab]').forEach((b) => b.classList.toggle('active', b === btn));
     $('key-pane-fresh').classList.toggle('hidden', t !== 'fresh');
     $('key-pane-restore').classList.toggle('hidden', t !== 'restore');
+    if (t === 'restore' && ($('restore-backup-select').options.length === 0 || $('restore-backup-select').value === '0')) {
+      probeChannelBackupsForWizard();
+    }
   });
 });
 
 async function probeChannelBackupsForWizard() {
   const sel = $('restore-backup-select');
-  sel.innerHTML = '';
+  sel.innerHTML = '<option value="0">Đang quét bản backup trên Channel...</option>';
   $('existing-backup-notice').classList.add('hidden');
   try {
     const res = await api('/api/ops/backups');
     const list = res.backups || [];
+    sel.innerHTML = '';
     if (list.length > 0) {
-      $('existing-backup-notice').textContent = `Phát hiện ${list.length} bản backup TeleMount trên Channel này! Anh có thể sang tab "Khôi phục từ Channel cũ" và nhập Encryption Key cũ.`;
+      $('existing-backup-notice').textContent = `Phát hiện ${list.length} bản backup trên Channel này! Anh có thể sang tab "Khôi phục từ Channel cũ" và nhập Encryption Key cũ.`;
       $('existing-backup-notice').classList.remove('hidden');
       list.forEach((b) => {
         const opt = document.createElement('option');
@@ -364,11 +368,26 @@ async function probeChannelBackupsForWizard() {
     } else {
       const opt = document.createElement('option');
       opt.value = '0';
-      opt.textContent = '(Chưa tìm thấy bản backup .tmdb nào trong Channel)';
+      opt.textContent = '(Chưa tìm thấy bản backup .tmdb / .tddb nào trong Channel)';
       sel.appendChild(opt);
     }
-  } catch (_) {}
+  } catch (err) {
+    sel.innerHTML = '';
+    const opt = document.createElement('option');
+    opt.value = '0';
+    opt.textContent = `(Lỗi tải danh sách backup: ${err.message})`;
+    sel.appendChild(opt);
+    toast(err.message, 'err');
+  }
 }
+
+$('btn-reload-wizard-backups').addEventListener('click', probeChannelBackupsForWizard);
+$('btn-change-channel').addEventListener('click', async () => {
+  try {
+    await api('/api/setup/channels/clear', { method: 'POST' });
+    await syncWizard();
+  } catch (err) { toast(err.message, 'err'); }
+});
 
 $('btn-gen-key').addEventListener('click', async () => {
   try {

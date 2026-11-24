@@ -2,8 +2,10 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -291,21 +293,42 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func parseFlexInt64(raw json.RawMessage) (int64, error) {
+	s := strings.TrimSpace(string(raw))
+	s = strings.Trim(s, `"`)
+	if s == "" || s == "null" {
+		return 0, nil
+	}
+	return strconv.ParseInt(s, 10, 64)
+}
+
 func (s *Server) handleSelectChannel(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID         int64  `json:"id"`
-		AccessHash int64  `json:"access_hash"`
-		Title      string `json:"title"`
+		ID         int64           `json:"id"`
+		AccessHash json.RawMessage `json:"access_hash"`
+		Title      string          `json:"title"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := s.engine.State().SetChannel(req.ID, req.AccessHash, req.Title); err != nil {
+	accessHash, err := parseFlexInt64(req.AccessHash)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid channel access_hash")
+		return
+	}
+	// Resolve authoritative 64-bit AccessHash from Telegram dialogs when connected to avoid any client precision loss.
+	if ch, ferr := s.tgMgr.FindDialogChannel(r.Context(), req.ID); ferr == nil && ch != nil && ch.AccessHash != 0 {
+		accessHash = ch.AccessHash
+		if req.Title == "" {
+			req.Title = ch.Title
+		}
+	}
+	if err := s.engine.State().SetChannel(req.ID, accessHash, req.Title); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.tgMgr.SetChannel(req.ID, req.AccessHash)
+	s.tgMgr.SetChannel(req.ID, accessHash)
 	// Probe the selected channel for any existing TeleMount encrypted DB backups so user can restore immediately.
 	backups, _ := s.engine.ListChannelBackups(r.Context())
 	if backups == nil {
@@ -314,6 +337,22 @@ func (s *Server) handleSelectChannel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"backups":    backups,
+		"setup_step": s.computeSetupStep(),
+	})
+}
+
+func (s *Server) handleClearChannel(w http.ResponseWriter, r *http.Request) {
+	if s.engine.State().HasMasterKey() {
+		writeErr(w, http.StatusConflict, "cannot clear channel after encryption key is initialized")
+		return
+	}
+	if err := s.engine.State().ClearChannel(); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.tgMgr.SetChannel(0, 0)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
 		"setup_step": s.computeSetupStep(),
 	})
 }

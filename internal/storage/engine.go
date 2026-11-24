@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	DBBackupPrefix    = "telemount-db-backup-"
-	DBBackupKeepCount = 5
+	DBBackupPrefix       = "telemount-db-backup-"
+	legacyDBBackupPrefix = "teledrive-db-backup-"
+	DBBackupKeepCount    = 5
 )
 
 var (
@@ -727,10 +728,20 @@ func (e *Engine) BackupDBToTelegram(ctx context.Context) (*tg.UploadedDoc, error
 	return doc, nil
 }
 
+func isBackupFileName(name string) bool {
+	return strings.HasPrefix(name, DBBackupPrefix) || strings.HasPrefix(name, legacyDBBackupPrefix)
+}
+
 func (e *Engine) ListChannelBackups(ctx context.Context) ([]tg.ChannelDoc, error) {
 	docs, err := e.tg.ListChannelDocs(ctx, DBBackupPrefix, 30)
 	if err != nil {
 		return nil, err
+	}
+	// Also fall back to legacy TeleDrive backups when restoring an existing pre-rename channel.
+	if len(docs) == 0 {
+		if legacyDocs, lerr := e.tg.ListChannelDocs(ctx, legacyDBBackupPrefix, 30); lerr == nil && len(legacyDocs) > 0 {
+			docs = append(docs, legacyDocs...)
+		}
 	}
 	sort.Slice(docs, func(i, j int) bool { return docs[i].MsgID > docs[j].MsgID })
 	return docs, nil
@@ -814,7 +825,7 @@ func (e *Engine) ScanOrphans(ctx context.Context) (*OrphanReport, error) {
 		Orphans:     make([]tg.ChannelDoc, 0),
 	}
 	for _, d := range docs {
-		if strings.HasPrefix(d.FileName, DBBackupPrefix) {
+		if isBackupFileName(d.FileName) {
 			continue
 		}
 		if !strings.HasSuffix(d.FileName, ".bin") {

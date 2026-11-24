@@ -2,7 +2,11 @@ package crypto
 
 import (
 	"bytes"
+	"compress/gzip"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"testing"
 )
@@ -115,5 +119,68 @@ func TestDBBackupRoundTripAndWrongPassphrase(t *testing.T) {
 
 	if _, _, _, err := DecryptDBBackup(blob, "wrong-pass"); err == nil {
 		t.Fatal("expected wrong passphrase to fail decryption")
+	}
+}
+
+func TestLegacyTeleDrivePartAndBackupCompat(t *testing.T) {
+	salt, err := NewSalt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	passphrase := "legacy-pass"
+	key := DeriveMasterKey(passphrase, salt)
+
+	// 1. Legacy TDP1 part block (HKDF info "teledrive-part-v1", AAD prefix "TDP1").
+	var hdr [PartHeaderSize]byte
+	copy(hdr[0:4], legacyPartHeaderMagic[:])
+	_, _ = io.ReadFull(rand.Reader, hdr[4:32])
+	partKey, err := derivePartKeyWithInfo(key, hdr[4:20], "teledrive-part-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blk, _ := aes.NewCipher(partKey)
+	aead, _ := cipher.NewGCM(blk)
+	var nonce [NonceSize]byte
+	var aad [12]byte
+	blockNonce(hdr[20:32], 0, nonce[:])
+	blockAADWithMagic(legacyPartHeaderMagic, 0, aad[:])
+	wantPlain := []byte("legacy teledrive encrypted payload")
+	ct := aead.Seal(nil, nonce[:], wantPlain, aad[:])
+
+	dec, err := NewPartDecryptor(key, hdr[:])
+	if err != nil {
+		t.Fatalf("NewPartDecryptor legacy TDP1: %v", err)
+	}
+	gotPlain, err := dec.DecryptBlock(0, ct, nil)
+	if err != nil || !bytes.Equal(gotPlain, wantPlain) {
+		t.Fatalf("legacy TDP1 decrypt = (%q, %v), want %q", gotPlain, err, wantPlain)
+	}
+
+	// 2. Legacy TDDB backup blob.
+	var gzBuf bytes.Buffer
+	gz := gzip.NewWriter(&gzBuf)
+	wantSQLite := []byte("SQLite format 3\x00legacy-db")
+	_, _ = gz.Write(wantSQLite)
+	_ = gz.Close()
+
+	var bhdr [dbBackupHeaderSize]byte
+	copy(bhdr[0:4], legacyDBBackupMagic[:])
+	bhdr[4] = 1
+	binary.BigEndian.PutUint32(bhdr[5:9], ArgonTime)
+	binary.BigEndian.PutUint32(bhdr[9:13], ArgonMemory)
+	bhdr[13] = ArgonThreads
+	copy(bhdr[14:30], salt)
+	_, _ = io.ReadFull(rand.Reader, bhdr[30:42])
+	mb, _ := aes.NewCipher(key)
+	maead, _ := cipher.NewGCM(mb)
+	legacyBlob := append([]byte(nil), bhdr[:]...)
+	legacyBlob = maead.Seal(legacyBlob, bhdr[30:42], gzBuf.Bytes(), bhdr[:])
+
+	gotSQLite, gotKey, gotSalt, err := DecryptDBBackup(legacyBlob, passphrase)
+	if err != nil {
+		t.Fatalf("DecryptDBBackup legacy TDDB: %v", err)
+	}
+	if !bytes.Equal(gotSQLite, wantSQLite) || !VerifyKeyEqual(gotKey, key) || !bytes.Equal(gotSalt, salt) {
+		t.Fatal("legacy TDDB restored content/key/salt mismatch")
 	}
 }

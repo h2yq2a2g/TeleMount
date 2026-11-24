@@ -37,8 +37,10 @@ const (
 )
 
 var (
-	PartHeaderMagic = [4]byte{'T', 'M', 'P', '1'}
-	DBBackupMagic   = [4]byte{'T', 'M', 'D', 'B'}
+	PartHeaderMagic       = [4]byte{'T', 'M', 'P', '1'}
+	DBBackupMagic         = [4]byte{'T', 'M', 'D', 'B'}
+	legacyPartHeaderMagic = [4]byte{'T', 'D', 'P', '1'}
+	legacyDBBackupMagic   = [4]byte{'T', 'D', 'D', 'B'}
 
 	ErrInvalidHeader  = errors.New("invalid encrypted header")
 	ErrDecryptFailed  = errors.New("decryption failed: wrong key or corrupted data")
@@ -106,10 +108,14 @@ func BlockCipherBounds(partPlainSize int64, blockIdx uint64) (offset int64, leng
 }
 
 func derivePartKey(masterKey, partSalt []byte) ([]byte, error) {
+	return derivePartKeyWithInfo(masterKey, partSalt, "telemount-part-v1")
+}
+
+func derivePartKeyWithInfo(masterKey, partSalt []byte, info string) ([]byte, error) {
 	if len(masterKey) != KeySize {
 		return nil, ErrInvalidKeySize
 	}
-	h := hkdf.New(sha256.New, masterKey, partSalt, []byte("telemount-part-v1"))
+	h := hkdf.New(sha256.New, masterKey, partSalt, []byte(info))
 	key := make([]byte, KeySize)
 	if _, err := io.ReadFull(h, key); err != nil {
 		return nil, err
@@ -127,7 +133,11 @@ func blockNonce(baseNonce []byte, blockIdx uint64, dst []byte) {
 }
 
 func blockAAD(blockIdx uint64, dst []byte) {
-	copy(dst[:4], PartHeaderMagic[:])
+	blockAADWithMagic(PartHeaderMagic, blockIdx, dst)
+}
+
+func blockAADWithMagic(magic [4]byte, blockIdx uint64, dst []byte) {
+	copy(dst[:4], magic[:])
 	binary.BigEndian.PutUint64(dst[4:12], blockIdx)
 }
 
@@ -231,14 +241,26 @@ func (e *EncryptReader) Read(p []byte) (int, error) {
 type PartDecryptor struct {
 	aead      cipher.AEAD
 	baseNonce [NonceSize]byte
+	magic     [4]byte
 }
 
-// NewPartDecryptor initializes a block decryptor from the master key and the 32-byte TMP1 header.
+// NewPartDecryptor initializes a block decryptor from the master key and the 32-byte TMP1 (or legacy TDP1) header.
 func NewPartDecryptor(masterKey []byte, header []byte) (*PartDecryptor, error) {
-	if len(header) != PartHeaderSize || !bytes.Equal(header[0:4], PartHeaderMagic[:]) {
+	if len(header) != PartHeaderSize {
 		return nil, ErrInvalidHeader
 	}
-	partKey, err := derivePartKey(masterKey, header[4:20])
+	var magic [4]byte
+	copy(magic[:], header[0:4])
+	var hkdfInfo string
+	switch magic {
+	case PartHeaderMagic:
+		hkdfInfo = "telemount-part-v1"
+	case legacyPartHeaderMagic:
+		hkdfInfo = "teledrive-part-v1"
+	default:
+		return nil, ErrInvalidHeader
+	}
+	partKey, err := derivePartKeyWithInfo(masterKey, header[4:20], hkdfInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -250,7 +272,7 @@ func NewPartDecryptor(masterKey []byte, header []byte) (*PartDecryptor, error) {
 	if err != nil {
 		return nil, err
 	}
-	pd := &PartDecryptor{aead: aead}
+	pd := &PartDecryptor{aead: aead, magic: magic}
 	copy(pd.baseNonce[:], header[20:32])
 	return pd, nil
 }
@@ -260,7 +282,7 @@ func (d *PartDecryptor) DecryptBlock(blockIdx uint64, ciphertext []byte, dst []b
 	var nonce [NonceSize]byte
 	var aad [12]byte
 	blockNonce(d.baseNonce[:], blockIdx, nonce[:])
-	blockAAD(blockIdx, aad[:])
+	blockAADWithMagic(d.magic, blockIdx, aad[:])
 	plain, err := d.aead.Open(dst[:0], nonce[:], ciphertext, aad[:])
 	if err != nil {
 		return nil, ErrDecryptFailed
@@ -318,7 +340,10 @@ func EncryptDBBackup(sqliteBytes, masterKey, kdfSalt []byte) ([]byte, error) {
 // DecryptDBBackup derives masterKey from passphrase using the Argon2id parameters embedded in the TMDB header,
 // authenticates & decrypts the payload, and returns the raw SQLite bytes along with masterKey and kdfSalt.
 func DecryptDBBackup(blob []byte, passphrase string) (sqliteBytes, masterKey, kdfSalt []byte, err error) {
-	if len(blob) < dbBackupHeaderSize+GCMTagSize || !bytes.Equal(blob[0:4], DBBackupMagic[:]) || blob[4] != 1 {
+	if len(blob) < dbBackupHeaderSize+GCMTagSize || blob[4] != 1 {
+		return nil, nil, nil, ErrInvalidHeader
+	}
+	if !bytes.Equal(blob[0:4], DBBackupMagic[:]) && !bytes.Equal(blob[0:4], legacyDBBackupMagic[:]) {
 		return nil, nil, nil, ErrInvalidHeader
 	}
 	hdr := blob[:dbBackupHeaderSize]

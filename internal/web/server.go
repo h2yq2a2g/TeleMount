@@ -73,6 +73,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/setup/channels", s.requireAdmin(s.handleListChannels))
 	s.mux.HandleFunc("POST /api/setup/channels/create", s.requireAdmin(s.handleCreateChannel))
 	s.mux.HandleFunc("POST /api/setup/channels/select", s.requireAdmin(s.handleSelectChannel))
+	s.mux.HandleFunc("POST /api/setup/channels/clear", s.requireAdmin(s.handleClearChannel))
 	s.mux.HandleFunc("GET /api/setup/key/generate", s.requireAdmin(s.handleGenerateKey))
 	s.mux.HandleFunc("POST /api/setup/key/init", s.requireAdmin(s.handleInitKey))
 	s.mux.HandleFunc("POST /api/setup/key/restore", s.requireAdmin(s.handleRestoreKey))

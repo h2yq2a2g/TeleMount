@@ -167,12 +167,19 @@
 
         <div id="key-pane-restore" class="stack hidden">
           <label>Chọn bản backup DB trên Channel
-            <select id="restore-backup-select"></select>
+            <div class="row-inline">
+              <select id="restore-backup-select"></select>
+              <button type="button" class="btn btn-secondary" id="btn-reload-wizard-backups">Quét lại</button>
+            </div>
           </label>
           <label>Nhập lại Encryption Key cũ
             <input type="password" id="restore-key-input" placeholder="Nhập đúng Encryption Key đã dùng trước đó" />
           </label>
           <button type="button" class="btn btn-primary" id="btn-restore-key">Giải mã &amp; Khôi phục dữ liệu</button>
+        </div>
+
+        <div style="margin-top:12px">
+          <button type="button" class="btn btn-ghost small-btn" id="btn-change-channel">← Chọn lại Channel khác</button>
         </div>
       </div>
 

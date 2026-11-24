@@ -58,7 +58,7 @@ type UploadedDoc struct {
 
 type ChannelInfo struct {
 	ID         int64  `json:"id"`
-	AccessHash int64  `json:"access_hash"`
+	AccessHash int64  `json:"access_hash,string"`
 	Title      string `json:"title"`
 }
 
@@ -66,8 +66,8 @@ type ChannelDoc struct {
 	MsgID      int    `json:"msg_id"`
 	FileName   string `json:"file_name"`
 	Caption    string `json:"caption"`
-	FileID     int64  `json:"file_id"`
-	AccessHash int64  `json:"access_hash"`
+	FileID     int64  `json:"file_id,string"`
+	AccessHash int64  `json:"access_hash,string"`
 	FileRef    []byte `json:"-"`
 	DCID       int    `json:"dc_id"`
 	Size       int64  `json:"size"`

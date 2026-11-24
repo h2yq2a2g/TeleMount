@@ -103,3 +103,54 @@ func TestSetupAdminAuthGuardsAndKeyInit(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+func TestSelectChannelPreserves64BitAccessHash(t *testing.T) {
+	dir := t.TempDir()
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "telemount.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	tgMgr := tg.NewManager(dir)
+	eng := storage.NewEngine(store, st, tgMgr, dir)
+	srv := NewServer(eng, tgMgr)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := setupAndLoginAdmin(t, ts)
+
+	// AccessHash exceeding JS Number.MAX_SAFE_INTEGER (2^53-1 = 9007199254740991).
+	const wantHash int64 = 7291847291847291843
+	payload, err := json.Marshal(tg.ChannelInfo{ID: 2147483649, AccessHash: wantHash, Title: "Old Vault"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(payload), `"access_hash":"7291847291847291843"`) {
+		t.Fatalf("expected ChannelInfo.AccessHash serialized as JSON string, got %s", payload)
+	}
+
+	resp, err := client.Post(ts.URL+"/api/setup/channels/select", "application/json", bytes.NewReader(payload))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("select channel failed: status=%v err=%v", resp, err)
+	}
+	resp.Body.Close()
+
+	if got := st.Snapshot().ChannelAccessHash; got != wantHash {
+		t.Fatalf("ChannelAccessHash = %d, want %d (64-bit precision lost!)", got, wantHash)
+	}
+
+	// Clearing channel before key init succeeds so user can switch channels in Step 4.
+	resp, err = client.Post(ts.URL+"/api/setup/channels/clear", "application/json", nil)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("clear channel failed: status=%v err=%v", resp, err)
+	}
+	resp.Body.Close()
+	if st.HasChannel() {
+		t.Fatal("expected channel cleared")
+	}
+}

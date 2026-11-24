@@ -143,6 +143,21 @@ func (s *Server) handleManualBackup(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 	backups, err := s.engine.ListChannelBackups(r.Context())
 	if err != nil {
+		// Self-heal stale/truncated 64-bit AccessHash saved by older builds by refreshing from Telegram dialogs.
+		snap := s.engine.State().Snapshot()
+		if snap.ChannelID != 0 {
+			if ch, ferr := s.tgMgr.FindDialogChannel(r.Context(), snap.ChannelID); ferr == nil && ch != nil && ch.AccessHash != 0 && ch.AccessHash != snap.ChannelAccessHash {
+				title := snap.ChannelTitle
+				if title == "" {
+					title = ch.Title
+				}
+				_ = s.engine.State().SetChannel(ch.ID, ch.AccessHash, title)
+				s.tgMgr.SetChannel(ch.ID, ch.AccessHash)
+				backups, err = s.engine.ListChannelBackups(r.Context())
+			}
+		}
+	}
+	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
