@@ -24,12 +24,19 @@ func envOr(key, def string) string {
 func main() {
 	headless := flag.Bool("headless", false, "run without desktop system tray or virtual drive mount")
 	minimized := flag.Bool("minimized", false, "start minimized in system tray without opening browser")
+	shellAction := flag.String("shell-action", "", "internal Explorer context menu action (pin|free|sync|status)")
+	shellPath := flag.String("path", "", "target Windows path for --shell-action")
 	flag.Parse()
 
 	defDataDir, defTmpDir, defListen := defaultRuntimePaths()
 	listenAddr := envOr("LISTEN_ADDR", defListen)
 	dataDir := envOr("DATA_DIR", defDataDir)
 	tmpDir := envOr("TMP_DIR", defTmpDir)
+
+	if *shellAction != "" {
+		runShellAction(dataDir, *shellAction, *shellPath)
+		return
+	}
 
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		log.Fatalf("create data dir %s: %v", dataDir, err)

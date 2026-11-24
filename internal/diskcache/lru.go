@@ -278,6 +278,123 @@ func (m *Manager) ClearUnpinned() error {
 	return nil
 }
 
+// PathCacheStatus summarizes local disk cache and pin state for a file or folder subtree.
+type PathCacheStatus struct {
+	Path        string
+	Pinned      bool
+	CachedFiles int
+	CachedBytes int64
+	DirtyFiles  int
+}
+
+// PathStatus returns cache and pin statistics for virtualPath (file, folder subtree, or "/").
+func (m *Manager) PathStatus(virtualPath string) (PathCacheStatus, error) {
+	norm := NormalizePath(virtualPath)
+	pathLower := strings.ToLower(norm)
+
+	m.stateMu.Lock()
+	pinned := m.isPinnedLocked(norm)
+	m.stateMu.Unlock()
+
+	var cnt, total, dirty sql.NullInt64
+	var err error
+	if norm == "/" {
+		err = m.db.QueryRow(`
+			SELECT COUNT(*), COALESCE(SUM(size), 0), COALESCE(SUM(CASE WHEN dirty = 1 THEN 1 ELSE 0 END), 0)
+			FROM cache_entries
+		`).Scan(&cnt, &total, &dirty)
+	} else {
+		pStart, pEnd := subtreeBounds(pathLower)
+		err = m.db.QueryRow(`
+			SELECT COUNT(*), COALESCE(SUM(size), 0), COALESCE(SUM(CASE WHEN dirty = 1 THEN 1 ELSE 0 END), 0)
+			FROM cache_entries
+			WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)
+		`, pathLower, pStart, pEnd).Scan(&cnt, &total, &dirty)
+	}
+	if err != nil {
+		return PathCacheStatus{}, err
+	}
+	return PathCacheStatus{
+		Path:        norm,
+		Pinned:      pinned,
+		CachedFiles: int(cnt.Int64),
+		CachedBytes: total.Int64,
+		DirtyFiles:  int(dirty.Int64),
+	}, nil
+}
+
+// EvictPath removes local cached blobs for a file or folder subtree while keeping cloud data intact.
+// Dirty (unsynced offline write) entries are preserved and counted in skippedDirty to prevent data loss.
+func (m *Manager) EvictPath(virtualPath string) (freedBytes int64, evictedFiles int, skippedDirty int, err error) {
+	norm := NormalizePath(virtualPath)
+	pathLower := strings.ToLower(norm)
+
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
+	var rows *sql.Rows
+	if norm == "/" {
+		rows, err = m.db.Query(`SELECT path_lower, blob_key, size, dirty FROM cache_entries`)
+	} else {
+		pStart, pEnd := subtreeBounds(pathLower)
+		rows, err = m.db.Query(
+			`SELECT path_lower, blob_key, size, dirty FROM cache_entries WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
+			pathLower, pStart, pEnd,
+		)
+	}
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	var cleanPaths []string
+	var blobKeys []string
+	for rows.Next() {
+		var pLower, bKey string
+		var sz int64
+		var dirtyInt int
+		if scanErr := rows.Scan(&pLower, &bKey, &sz, &dirtyInt); scanErr != nil {
+			_ = rows.Close()
+			return 0, 0, 0, scanErr
+		}
+		if dirtyInt != 0 {
+			skippedDirty++
+			continue
+		}
+		cleanPaths = append(cleanPaths, pLower)
+		freedBytes += sz
+		if bKey != "" {
+			blobKeys = append(blobKeys, bKey)
+		}
+	}
+	if closeErr := rows.Close(); closeErr != nil {
+		return 0, 0, 0, closeErr
+	}
+	if len(cleanPaths) == 0 {
+		return 0, 0, skippedDirty, nil
+	}
+
+	tx, err := m.db.Begin()
+	if err != nil {
+		return 0, 0, skippedDirty, err
+	}
+	defer tx.Rollback()
+
+	for _, pLower := range cleanPaths {
+		res, execErr := tx.Exec(`DELETE FROM cache_entries WHERE path_lower = ? AND dirty = 0`, pLower)
+		if execErr != nil {
+			return 0, 0, skippedDirty, execErr
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			evictedFiles += int(n)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, skippedDirty, err
+	}
+	m.scheduleBlobDeletes(blobKeys)
+	return freedBytes, evictedFiles, skippedDirty, nil
+}
+
 // Stats returns current disk cache usage statistics.
 func (m *Manager) Stats() CacheStats {
 	m.stateMu.Lock()

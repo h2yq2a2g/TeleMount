@@ -1068,4 +1068,68 @@ func TestOpenNilStoreAndNilEngineDefaultsAndOrphanCleanup(t *testing.T) {
 	}
 }
 
+func TestEvictPathAndPathStatusPreservesDirtyAndCloud(t *testing.T) {
+	dir := t.TempDir()
+	fb := newFakeBackend(true)
+	fb.PutFile("/work/a.txt", bytes.Repeat([]byte("A"), 120), "e1")
+	fb.PutFile("/work/sub/b.txt", bytes.Repeat([]byte("B"), 80), "e2")
+	fb.PutFile("/other/c.txt", bytes.Repeat([]byte("C"), 60), "e3")
+
+	mgr, err := OpenWithBackend(filepath.Join(dir, "cache"), filepath.Join(dir, "cache.db"), DefaultMaxBytes, nil, fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+	_, _ = mgr.ReadFileAt(ctx, "/work/a.txt", make([]byte, 120), 0)
+	_, _ = mgr.ReadFileAt(ctx, "/work/sub/b.txt", make([]byte, 80), 0)
+	_, _ = mgr.ReadFileAt(ctx, "/other/c.txt", make([]byte, 60), 0)
+
+	// Queue one dirty offline file inside /work so we verify EvictPath NEVER drops unsynced writes.
+	fb.SetOnline(false)
+	stPath, err := mgr.StageOpenForWrite("/work/dirty.txt", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(stPath, []byte("unsynced"), 0o600)
+	if err := mgr.CommitFile(ctx, "/work/dirty.txt", stPath, 8, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+
+	ps, err := mgr.PathStatus("/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ps.CachedFiles != 3 || ps.CachedBytes != 208 || ps.DirtyFiles != 1 {
+		t.Fatalf("PathStatus(/work) before evict = %+v", ps)
+	}
+
+	freed, evicted, skippedDirty, err := mgr.EvictPath("/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if freed != 200 || evicted != 2 || skippedDirty != 1 {
+		t.Fatalf("EvictPath(/work) = (freed=%d, evicted=%d, skippedDirty=%d), want (200, 2, 1)", freed, evicted, skippedDirty)
+	}
+
+	// /work/a.txt is now cloud-only (offline read fails), while dirty file & /other/c.txt remain intact!
+	if _, err := mgr.ReadFileAt(ctx, "/work/a.txt", make([]byte, 120), 0); !errors.Is(err, ErrOfflineUncached) {
+		t.Fatalf("expected /work/a.txt evicted from local cache, got %v", err)
+	}
+	if _, err := mgr.ReadFileAt(ctx, "/work/dirty.txt", make([]byte, 8), 0); err != nil {
+		t.Fatalf("dirty file lost on EvictPath: %v", err)
+	}
+	if _, err := mgr.ReadFileAt(ctx, "/other/c.txt", make([]byte, 60), 0); err != nil {
+		t.Fatalf("unrelated /other/c.txt evicted: %v", err)
+	}
+
+	// Re-going online seamlessly fetches /work/a.txt back from cloud (cloud untouched!).
+	fb.SetOnline(true)
+	buf := make([]byte, 120)
+	if n, err := mgr.ReadFileAt(ctx, "/work/a.txt", buf, 0); err != nil || n != 120 {
+		t.Fatalf("cloud re-fetch after EvictPath failed: (%d, %v)", n, err)
+	}
+}
+
 

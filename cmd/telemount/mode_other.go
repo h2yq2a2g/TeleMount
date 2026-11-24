@@ -22,6 +22,10 @@ func defaultRuntimePaths() (dataDir, tmpDir, listenAddr string) {
 	return "/data", "/tmp/telemount", ":8080"
 }
 
+func runShellAction(_, _, _ string) {
+	log.Fatal("--shell-action is only supported on Windows desktop")
+}
+
 func runPlatform(
 	_ context.Context,
 	appCancel context.CancelFunc,

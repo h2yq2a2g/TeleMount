@@ -3,7 +3,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -12,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -26,6 +31,62 @@ import (
 	"telemount/internal/vfs"
 	"telemount/internal/web"
 )
+
+type desktopIPCInfo struct {
+	URL   string `json:"url"`
+	Token string `json:"token"`
+	Drive string `json:"drive"`
+}
+
+func desktopIPCFilePath(dataDir string) string {
+	return filepath.Join(dataDir, "desktop_ipc.json")
+}
+
+func generateIPCToken() string {
+	var b [32]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+func writeDesktopIPCFile(dataDir string, info desktopIPCInfo) {
+	b, err := json.Marshal(info)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(desktopIPCFilePath(dataDir), b, 0o600)
+}
+
+func runShellAction(dataDir, action, rawPath string) {
+	raw, err := os.ReadFile(desktopIPCFilePath(dataDir))
+	if err != nil {
+		log.Fatalf("TeleMount chưa chạy hoặc không đọc được IPC: %v", err)
+	}
+	var ipc desktopIPCInfo
+	if err := json.Unmarshal(raw, &ipc); err != nil || ipc.URL == "" || ipc.Token == "" {
+		log.Fatalf("invalid TeleMount IPC state")
+	}
+	vpath, err := desktop.MapWindowsPathToVirtual(rawPath, ipc.Drive)
+	if err != nil {
+		log.Fatalf("invalid target path %q: %v", rawPath, err)
+	}
+	body, _ := json.Marshal(map[string]string{
+		"action": strings.ToLower(strings.TrimSpace(action)),
+		"path":   vpath,
+	})
+	req, err := http.NewRequest(http.MethodPost, ipc.URL+"/api/desktop/shell-action", bytes.NewReader(body))
+	if err != nil {
+		log.Fatalf("build shell action request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-TeleMount-IPC-Token", ipc.Token)
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Fatalf("send shell action: %v", err)
+	}
+	defer resp.Body.Close()
+}
 
 func defaultRuntimePaths() (dataDir, tmpDir, listenAddr string) {
 	base := os.Getenv("LOCALAPPDATA")
@@ -108,10 +169,15 @@ func runPlatform(
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
+	ipcToken := generateIPCToken()
+	srv.SetDesktopIPCToken(ipcToken)
+
 	rt := &desktopRuntime{
 		appCancel:    appCancel,
+		dataDir:      dataDir,
 		exePath:      exePath,
 		webURL:       webURL,
+		ipcToken:     ipcToken,
 		cfgStore:     cfgStore,
 		cache:        cache,
 		mountMgr:     mountMgr,
@@ -123,6 +189,8 @@ func runPlatform(
 		httpSrv:      httpSrv,
 	}
 	srv.SetDesktopController(rt)
+	rt.syncShellIntegration(cfg.DriveLetter)
+	defer os.Remove(desktopIPCFilePath(dataDir))
 
 	trayApp, err := tray.New(&trayActionsAdapter{rt: rt})
 	if err != nil {
@@ -217,8 +285,10 @@ func runHeadlessWindows(
 
 type desktopRuntime struct {
 	appCancel    context.CancelFunc
+	dataDir      string
 	exePath      string
 	webURL       string
+	ipcToken     string
 	cfgStore     *desktop.ConfigStore
 	cache        *diskcache.Manager
 	mountMgr     *vfs.MountManager
@@ -229,9 +299,31 @@ type desktopRuntime struct {
 	tgMgr        *tg.Manager
 	httpSrv      *http.Server
 
-	trayMu       sync.RWMutex
-	trayApp      *tray.App
-	quitOnce     sync.Once
+	trayMu   sync.RWMutex
+	trayApp  *tray.App
+	quitOnce sync.Once
+}
+
+func (r *desktopRuntime) syncShellIntegration(driveLetter string) {
+	writeDesktopIPCFile(r.dataDir, desktopIPCInfo{
+		URL:   r.webURL,
+		Token: r.ipcToken,
+		Drive: driveLetter,
+	})
+	if r.exePath != "" {
+		if err := desktop.RegisterShellMenu(r.exePath, driveLetter); err != nil {
+			log.Printf("register explorer shell menu warning: %v", err)
+		}
+	}
+}
+
+func (r *desktopRuntime) notifyTray(title, msg string, isErr bool) {
+	r.trayMu.RLock()
+	app := r.trayApp
+	r.trayMu.RUnlock()
+	if app != nil {
+		_ = app.Notify(title, msg, isErr)
+	}
 }
 
 func (r *desktopRuntime) setTray(app *tray.App) {
@@ -356,16 +448,149 @@ func (r *desktopRuntime) UpdateSettings(u web.DesktopSettingsUpdate) (web.Deskto
 		}
 	}
 
-	// If drive letter changed while mounted, cleanly remount on the new drive letter.
-	if u.DriveLetter != nil && wasMounted && updated.DriveLetter != oldCfg.DriveLetter {
-		_ = r.mountMgr.Unmount(context.Background())
-		if err := r.mountMgr.Mount(updated.DriveLetter); err != nil {
-			return r.Status(), err
+	// If drive letter changed, update Explorer context menu filter & IPC state, and remount if active.
+	if u.DriveLetter != nil && updated.DriveLetter != oldCfg.DriveLetter {
+		r.syncShellIntegration(updated.DriveLetter)
+		if wasMounted {
+			_ = r.mountMgr.Unmount(context.Background())
+			if err := r.mountMgr.Mount(updated.DriveLetter); err != nil {
+				return r.Status(), err
+			}
 		}
 	}
 
 	r.refreshTray()
 	return r.Status(), nil
+}
+
+func (r *desktopRuntime) HandleShellAction(ctx context.Context, action, rawPath string) (web.ShellActionResult, error) {
+	vpath := desktop.NormalizeVirtualPath(rawPath)
+	switch action {
+	case "pin":
+		cfg := r.cfgStore.Get()
+		pins := append([]string(nil), cfg.PinnedPaths...)
+		if !desktop.IsPathPinned(pins, vpath) {
+			pins = append(pins, vpath)
+			if _, err := r.UpdateSettings(web.DesktopSettingsUpdate{PinnedPaths: &pins}); err != nil {
+				r.notifyTray("TeleMount — Lỗi ghim offline", err.Error(), true)
+				return web.ShellActionResult{}, err
+			}
+		}
+		if r.engine.IsReady() {
+			r.notifyTray("TeleMount — Giữ offline", fmt.Sprintf("Đang tải lưu offline: %s", vpath), false)
+			go func() {
+				if err := r.cache.PinSync(context.Background(), vpath); err != nil {
+					r.notifyTray("TeleMount — Lỗi tải offline", fmt.Sprintf("%s: %v", vpath, err), true)
+					return
+				}
+				ps, _ := r.cache.PathStatus(vpath)
+				r.notifyTray("TeleMount — Đã giữ trên máy", fmt.Sprintf("%s (%d tệp · %s)", vpath, ps.CachedFiles, fmtHumanBytes(ps.CachedBytes)), false)
+				r.refreshTray()
+			}()
+		} else {
+			r.notifyTray("TeleMount — Đã ghim offline", fmt.Sprintf("%s (sẽ tự tải khi Telegram online)", vpath), false)
+		}
+		return web.ShellActionResult{OK: true, Message: "pinned " + vpath}, nil
+
+	case "free":
+		// Remove exact path and any nested child pins under this folder.
+		targetLower := strings.ToLower(vpath)
+		updated, err := r.cfgStore.Update(func(c *desktop.Config) error {
+			kept := make([]string, 0, len(c.PinnedPaths))
+			for _, p := range c.PinnedPaths {
+				normP := desktop.NormalizeVirtualPath(p)
+				lowP := strings.ToLower(normP)
+				if vpath == "/" || lowP == targetLower || strings.HasPrefix(lowP, targetLower+"/") {
+					continue
+				}
+				kept = append(kept, normP)
+			}
+			c.PinnedPaths = kept
+			return nil
+		})
+		if err != nil {
+			r.notifyTray("TeleMount — Lỗi giải phóng", err.Error(), true)
+			return web.ShellActionResult{}, err
+		}
+		_ = r.cache.SetPinnedPaths(updated.PinnedPaths)
+
+		if desktop.IsPathPinned(updated.PinnedPaths, vpath) {
+			msg := fmt.Sprintf("Thư mục cha của %s đang được ghim offline — hãy chọn Giải phóng dung lượng trên thư mục cha.", vpath)
+			r.notifyTray("TeleMount — Đang bị ghim từ thư mục cha", msg, true)
+			return web.ShellActionResult{OK: false, Message: msg}, nil
+		}
+
+		freed, evicted, skippedDirty, err := r.cache.EvictPath(vpath)
+		if err != nil {
+			r.notifyTray("TeleMount — Lỗi giải phóng", err.Error(), true)
+			return web.ShellActionResult{}, err
+		}
+		var msg string
+		switch {
+		case evicted > 0 && skippedDirty > 0:
+			msg = fmt.Sprintf("Đã giải phóng %s (%d tệp) khỏi máy, vẫn giữ trên Cloud. Giữ lại %d tệp chưa đồng bộ.", fmtHumanBytes(freed), evicted, skippedDirty)
+		case evicted > 0:
+			msg = fmt.Sprintf("Đã giải phóng %s (%d tệp) khỏi máy — dữ liệu vẫn giữ an toàn trên Telegram Cloud.", fmtHumanBytes(freed), evicted)
+		case skippedDirty > 0:
+			msg = fmt.Sprintf("Chưa thể giải phóng %s vì còn %d tệp chưa đồng bộ lên Telegram.", vpath, skippedDirty)
+		default:
+			msg = fmt.Sprintf("%s hiện chỉ nằm trên Cloud (0 B trên máy).", vpath)
+		}
+		r.notifyTray("TeleMount — Giải phóng dung lượng", msg, skippedDirty > 0 && evicted == 0)
+		r.refreshTray()
+		return web.ShellActionResult{OK: true, Message: msg}, nil
+
+	case "sync":
+		if err := r.FlushQueue(ctx); err != nil {
+			r.notifyTray("TeleMount — Lỗi đồng bộ", err.Error(), true)
+			return web.ShellActionResult{}, err
+		}
+		if r.engine.IsReady() && desktop.IsPathPinned(r.cfgStore.Get().PinnedPaths, vpath) {
+			go func() {
+				_ = r.cache.PinSync(context.Background(), vpath)
+				r.refreshTray()
+			}()
+		}
+		msg := fmt.Sprintf("Đã đồng bộ xong: %s", vpath)
+		r.notifyTray("TeleMount — Đồng bộ ngay", msg, false)
+		return web.ShellActionResult{OK: true, Message: msg}, nil
+
+	case "status":
+		ps, err := r.cache.PathStatus(vpath)
+		if err != nil {
+			r.notifyTray("TeleMount — Lỗi kiểm tra", err.Error(), true)
+			return web.ShellActionResult{}, err
+		}
+		stateLabel := "Chỉ trên Cloud (tự tải khi mở)"
+		if ps.Pinned {
+			stateLabel = "Luôn giữ offline trên máy"
+		} else if ps.CachedFiles > 0 {
+			stateLabel = "Đang lưu đệm trên máy (cache)"
+		}
+		msg := fmt.Sprintf("%s\n%s · Trên máy: %s (%d tệp)", vpath, stateLabel, fmtHumanBytes(ps.CachedBytes), ps.CachedFiles)
+		if ps.DirtyFiles > 0 {
+			msg += fmt.Sprintf(" · Chờ upload: %d", ps.DirtyFiles)
+		}
+		r.notifyTray("TeleMount — Trạng thái", msg, false)
+		return web.ShellActionResult{OK: true, Message: msg}, nil
+
+	default:
+		return web.ShellActionResult{}, fmt.Errorf("unknown shell action %q", action)
+	}
+}
+
+func fmtHumanBytes(b int64) string {
+	if b < 1024 {
+		return fmt.Sprintf("%d B", b)
+	}
+	units := []string{"KB", "MB", "GB", "TB"}
+	v := float64(b) / 1024
+	i := 0
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
 }
 
 func (r *desktopRuntime) Mount() error {
@@ -436,6 +661,7 @@ func (r *desktopRuntime) Quit() {
 func (r *desktopRuntime) shutdownOnce() {
 	r.quitOnce.Do(func() {
 		log.Println("shutting down TeleMount desktop (unmounting drive and flushing pending writes)...")
+		_ = os.Remove(desktopIPCFilePath(r.dataDir))
 		shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		_ = r.mountMgr.Unmount(shutCtx)

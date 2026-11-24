@@ -521,3 +521,48 @@ func TestNoFileBrowserOrTrashRoutesOrViews(t *testing.T) {
 		}
 	}
 }
+
+type mockShellController struct {
+	*mockDesktopController
+	lastAction string
+	lastPath   string
+}
+
+func (m *mockShellController) HandleShellAction(_ context.Context, action, virtualPath string) (ShellActionResult, error) {
+	m.lastAction = action
+	m.lastPath = virtualPath
+	return ShellActionResult{OK: true, Message: action + ":" + virtualPath}, nil
+}
+
+func TestDesktopShellActionIPCTokenAuth(t *testing.T) {
+	srv, _, _, ts := newTestWebServer(t)
+	ctrl := &mockShellController{mockDesktopController: newMockDesktopController()}
+	srv.SetDesktopController(ctrl)
+	srv.SetDesktopIPCToken("secret-ipc-token-123")
+
+	// Missing token before admin setup -> 403.
+	resp, err := http.Post(ts.URL+"/api/desktop/shell-action", "application/json", strings.NewReader(`{"action":"pin","path":"/Docs"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("without IPC token expected 403, got %d", resp.StatusCode)
+	}
+
+	// Valid IPC token bypasses admin cookie for local Explorer shell integration.
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/desktop/shell-action", strings.NewReader(`{"action":"free","path":"/Docs/big.iso"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-TeleMount-IPC-Token", "secret-ipc-token-123")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("with valid IPC token expected 200, got %d", resp.StatusCode)
+	}
+	if ctrl.lastAction != "free" || ctrl.lastPath != "/Docs/big.iso" {
+		t.Fatalf("unexpected shell action dispatch: (%q, %q)", ctrl.lastAction, ctrl.lastPath)
+	}
+}

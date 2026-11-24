@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"net/http"
 	"path"
@@ -46,10 +47,37 @@ type DesktopController interface {
 	ClearUnpinnedCache() error
 }
 
+type ShellActionResult struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message"`
+}
+
+// ShellActionHandler is an optional extension of DesktopController for Windows Explorer context menu actions.
+type ShellActionHandler interface {
+	HandleShellAction(ctx context.Context, action, virtualPath string) (ShellActionResult, error)
+}
+
 func (s *Server) SetDesktopController(ctrl DesktopController) {
 	s.desktopMu.Lock()
 	defer s.desktopMu.Unlock()
 	s.desktopCtrl = ctrl
+}
+
+func (s *Server) SetDesktopIPCToken(token string) {
+	s.desktopMu.Lock()
+	defer s.desktopMu.Unlock()
+	s.desktopIPCToken = token
+}
+
+func (s *Server) verifyDesktopIPCToken(r *http.Request) bool {
+	s.desktopMu.RLock()
+	want := s.desktopIPCToken
+	s.desktopMu.RUnlock()
+	if want == "" {
+		return false
+	}
+	got := r.Header.Get("X-TeleMount-IPC-Token")
+	return len(got) == len(want) && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 func (s *Server) desktop() DesktopController {
@@ -244,4 +272,41 @@ func (s *Server) handleDesktopQueueFlush(w http.ResponseWriter, r *http.Request)
 		"ok":     true,
 		"status": normalizeStatus(ctrl.Status()),
 	})
+}
+
+func (s *Server) handleDesktopShellAction(w http.ResponseWriter, r *http.Request) {
+	if !s.verifyDesktopIPCToken(r) {
+		if !s.engine.State().HasAdmin() {
+			writeErr(w, http.StatusForbidden, "initial admin setup required")
+			return
+		}
+		if _, ok := s.isAuthenticated(r); !ok {
+			writeErr(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+	}
+	ctrl := s.desktop()
+	if ctrl == nil {
+		writeErr(w, http.StatusServiceUnavailable, "desktop mode is not enabled")
+		return
+	}
+	handler, ok := ctrl.(ShellActionHandler)
+	if !ok {
+		writeErr(w, http.StatusNotImplemented, "shell actions not supported")
+		return
+	}
+	var req struct {
+		Action string `json:"action"`
+		Path   string `json:"path"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	res, err := handler.HandleShellAction(r.Context(), strings.ToLower(strings.TrimSpace(req.Action)), req.Path)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }

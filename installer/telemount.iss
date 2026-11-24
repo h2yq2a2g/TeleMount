@@ -129,5 +129,10 @@ begin
   begin
     // Remove startup entry even if it was enabled later via Tray or Web UI.
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'TeleMount');
+    // Remove Windows Explorer right-click context menus cleanly.
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\*\shell\TeleMount');
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\Directory\shell\TeleMount');
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\Directory\Background\shell\TeleMount');
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\Drive\shell\TeleMount');
   end;
 end;
