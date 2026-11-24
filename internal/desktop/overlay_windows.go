@@ -124,9 +124,35 @@ func startOverlayServerNamed(shmName, pipeName string, query OverlayQueryFunc) (
 		stopEvent: stopEv,
 	}
 
+	// Create the first Named Pipe instance synchronously so callers never race with startup.
+	firstPipe, err := s.createPipeInstance()
+	if err != nil {
+		_ = windows.CloseHandle(stopEv)
+		_ = windows.UnmapViewOfFile(view)
+		_ = windows.CloseHandle(hMap)
+		return nil, fmt.Errorf("create overlay named pipe: %w", err)
+	}
+
 	s.wg.Add(1)
-	go s.acceptLoop()
+	go s.acceptLoop(firstPipe)
 	return s, nil
+}
+
+func (s *OverlayServer) createPipeInstance() (windows.Handle, error) {
+	pipeNamePtr, err := windows.UTF16PtrFromString(s.pipeName)
+	if err != nil {
+		return 0, err
+	}
+	return windows.CreateNamedPipe(
+		pipeNamePtr,
+		pipeAccessDuplex|windows.FILE_FLAG_OVERLAPPED,
+		pipeTypeMessage|pipeReadmodeMessage|pipeWait,
+		windows.PIPE_UNLIMITED_INSTANCES,
+		64,
+		4096,
+		50,
+		nil,
+	)
 }
 
 // SetDrive sets or clears (when empty) the active mounted drive letter visible to telemount_shell.dll.
@@ -247,34 +273,31 @@ func (s *OverlayServer) Close() error {
 	return nil
 }
 
-func (s *OverlayServer) acceptLoop() {
+func (s *OverlayServer) acceptLoop(nextPipe windows.Handle) {
 	defer s.wg.Done()
-	pipeNamePtr, err := windows.UTF16PtrFromString(s.pipeName)
-	if err != nil {
-		return
-	}
 
 	for {
 		if w, _ := windows.WaitForSingleObject(s.stopEvent, 0); w == windows.WAIT_OBJECT_0 {
+			if nextPipe != 0 {
+				_ = windows.CloseHandle(nextPipe)
+			}
 			return
 		}
 
-		hPipe, err := windows.CreateNamedPipe(
-			pipeNamePtr,
-			pipeAccessDuplex|windows.FILE_FLAG_OVERLAPPED,
-			pipeTypeMessage|pipeReadmodeMessage|pipeWait,
-			windows.PIPE_UNLIMITED_INSTANCES,
-			64,
-			4096,
-			50,
-			nil,
-		)
-		if err != nil {
-			// Brief wait on stopEvent before retrying transient OS errors.
-			if w, _ := windows.WaitForSingleObject(s.stopEvent, 200); w == windows.WAIT_OBJECT_0 {
-				return
+		var hPipe windows.Handle
+		if nextPipe != 0 {
+			hPipe = nextPipe
+			nextPipe = 0
+		} else {
+			var err error
+			hPipe, err = s.createPipeInstance()
+			if err != nil {
+				// Brief wait on stopEvent before retrying transient OS errors.
+				if w, _ := windows.WaitForSingleObject(s.stopEvent, 200); w == windows.WAIT_OBJECT_0 {
+					return
+				}
+				continue
 			}
-			continue
 		}
 
 		connEv, err := windows.CreateEvent(nil, 1, 0, nil)
@@ -308,6 +331,11 @@ func (s *OverlayServer) acceptLoop() {
 		if !connected {
 			_ = windows.CloseHandle(hPipe)
 			continue
+		}
+
+		// Pre-create the next listening instance before handing off hPipe so the pipe never disappears between calls.
+		if np, cerr := s.createPipeInstance(); cerr == nil {
+			nextPipe = np
 		}
 
 		s.wg.Add(1)
