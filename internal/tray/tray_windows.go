@@ -4,6 +4,7 @@ package tray
 
 import (
 	"context"
+	_ "embed"
 	"errors"
 	"os/exec"
 	"runtime"
@@ -359,7 +360,24 @@ func (a *App) stopActionWorker(ch chan uint16, workerDone chan struct{}) {
 	<-workerDone
 }
 
+//go:embed icon_tray.png
+var trayIconPNG []byte
+
 func createTrayIcon() (uintptr, bool) {
+	if len(trayIconPNG) > 0 {
+		hIcon, _, _ := procCreateIconFromResEx.Call(
+			uintptr(unsafe.Pointer(&trayIconPNG[0])),
+			uintptr(len(trayIconPNG)),
+			1,
+			0x00030000,
+			0,
+			0,
+			0,
+		)
+		if hIcon != 0 {
+			return hIcon, true
+		}
+	}
 	dib := BuildTrayIconDIB(32)
 	hIcon, _, _ := procCreateIconFromResEx.Call(
 		uintptr(unsafe.Pointer(&dib[0])),

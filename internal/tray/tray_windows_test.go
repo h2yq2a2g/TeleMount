@@ -60,3 +60,14 @@ func TestCopyUTF16Safety(t *testing.T) {
 		t.Fatalf("expected 'ab', got %q", string(got))
 	}
 }
+
+func TestCreateTrayIconFromEmbeddedPNG(t *testing.T) {
+	if len(trayIconPNG) == 0 {
+		t.Fatal("embedded trayIconPNG is empty")
+	}
+	hIcon, owned := createTrayIcon()
+	if hIcon == 0 || !owned {
+		t.Fatalf("createTrayIcon() = (0x%x, %v), want non-zero owned HICON", hIcon, owned)
+	}
+	procDestroyIcon.Call(hIcon)
+}

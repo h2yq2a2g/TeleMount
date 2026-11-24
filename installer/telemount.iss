@@ -36,6 +36,7 @@ WizardStyle=modern
 CloseApplications=yes
 CloseApplicationsFilter=telemount.exe
 RestartApplications=no
+SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\telemount.exe
 
 [Languages]
