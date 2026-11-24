@@ -61,6 +61,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 ; runasoriginaluser is critical so telemount.exe runs non-elevated (visible V: drive & user %LocalAppData%).
 Filename: "{app}\telemount.exe"; Description: "{cm:LaunchProgram,TeleMount}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; Silent auto-update: automatically relaunch minimized in tray as normal user.
+Filename: "{app}\telemount.exe"; Parameters: "--minimized"; Flags: nowait skipifnotsilent runasoriginaluser
 
 [Code]
 var

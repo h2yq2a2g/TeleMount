@@ -989,6 +989,19 @@ function renderDesktopStatus(d) {
   $('desktop-winfsp-guidance').textContent =
     d.winfsp_guidance || 'Cài đặt WinFsp từ winfsp.dev hoặc chạy winget install WinFsp.WinFsp để bật ổ đĩa ảo.';
 
+  if ($('desktop-app-version')) {
+    $('desktop-app-version').textContent = d.app_version ? `(${d.app_version})` : '';
+  }
+  const updBanner = $('desktop-update-banner');
+  if (updBanner) {
+    updBanner.classList.toggle('hidden', !d.update_available);
+    if (d.update_available) {
+      $('desktop-update-title').textContent = `Có phiên bản TeleMount mới: ${d.latest_version}`;
+      $('desktop-update-desc').textContent = `Đang dùng ${d.app_version || 'dev'} · Bản cài sẽ được xác thực SHA-256 trước khi cập nhật.`;
+      if (d.release_url) $('desktop-update-link').href = d.release_url;
+    }
+  }
+
   $('desktop-drive-letter').textContent = d.drive_letter || 'V:';
   const badge = $('desktop-mount-badge');
   badge.textContent = d.mounted ? '● Đã gắn (Mounted)' : '● Chưa gắn (Unmounted)';
@@ -1104,6 +1117,39 @@ $('btn-desktop-clear-cache').addEventListener('click', async () => {
   }
 });
 
+$('btn-desktop-check-update').addEventListener('click', async () => {
+  const btn = $('btn-desktop-check-update');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/desktop/update/check', { method: 'POST' });
+    if (r && r.status) {
+      renderDesktopStatus(r.status);
+      if (r.status.update_available) {
+        toast(`Đã phát hiện phiên bản mới ${r.status.latest_version}!`);
+      } else {
+        toast(`Đang dùng phiên bản mới nhất (${r.status.app_version || 'dev'}).`);
+      }
+    }
+  } catch (err) {
+    toast(err.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('btn-desktop-apply-update').addEventListener('click', async () => {
+  const btn = $('btn-desktop-apply-update');
+  btn.disabled = true;
+  try {
+    toast('Đang tải, kiểm tra SHA-256 và khởi chạy bộ cài cập nhật...');
+    await api('/api/desktop/update/apply', { method: 'POST' });
+    toast('Đang cập nhật TeleMount — app sẽ tự khởi động lại trong giây lát!');
+  } catch (err) {
+    toast(err.message, 'err');
+    btn.disabled = false;
+  }
+});
+
 function bytesToCacheInput(bytes) {
   const GiB = 1024 * 1024 * 1024;
   const MiB = 1024 * 1024;
@@ -1154,6 +1200,7 @@ function populateDesktopSettingsForm(d) {
   $('set-desktop-pinned').value = (d.pinned_paths || []).join('\n');
   $('set-desktop-startup').checked = Boolean(d.run_at_startup);
   $('set-desktop-automount').checked = d.auto_mount !== undefined ? Boolean(d.auto_mount) : true;
+  $('set-desktop-autoupdate').checked = d.auto_update !== undefined ? Boolean(d.auto_update) : true;
 }
 
 async function loadDesktopSettings() {
@@ -1190,6 +1237,7 @@ $('form-desktop-settings').addEventListener('submit', async (e) => {
         pinned_paths: pinnedPaths,
         run_at_startup: $('set-desktop-startup').checked,
         auto_mount: $('set-desktop-automount').checked,
+        auto_update: $('set-desktop-autoupdate').checked,
       }),
     });
     populateDesktopSettingsForm(updated);

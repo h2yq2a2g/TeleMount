@@ -33,6 +33,7 @@ type Config struct {
 	PinnedPaths       []string `json:"pinned_paths"`
 	RunAtStartup      bool     `json:"run_at_startup"`
 	AutoMount         bool     `json:"auto_mount"`
+	AutoUpdate        bool     `json:"auto_update"`
 	WebAddr           string   `json:"web_addr"`
 }
 
@@ -45,6 +46,7 @@ func DefaultConfig(dataDir string) Config {
 		PinnedPaths:       []string{},
 		RunAtStartup:      false,
 		AutoMount:         true,
+		AutoUpdate:        true,
 		WebAddr:           DefaultWebAddr,
 	}
 }

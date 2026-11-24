@@ -22,30 +22,24 @@ Self-hosted **Telegram-backed encrypted storage** written in pure Go (`CGO_ENABL
 - **SQLite + Auto Encrypted Backup**: Metadata lives in `telemount.db` (WAL + `temp_store=MEMORY`) and auto-backs up (gzipped + Argon2id/AES-256-GCM `.tmdb`) to your Telegram Private Channel.
 - **Multi-Account Server-Side Backup Mirroring**: Add 1 or more secondary Telegram accounts in Settings — TeleMount creates a dedicated private channel owned by each backup account and server-side copies (`DropAuthor: true`, 0 MB server bandwidth) every Pack/part + `.tmdb` backup with automatic read failover, one-click Promote to Primary, and fresh-machine recovery from any backup channel.
 
-## Quick Start — Windows Desktop (`TeleMount-Setup.exe` / `telemount.exe`)
+## Quick Start — Windows Desktop (`TeleMount-Setup.exe`)
 
-### Option A: Single-File Setup Installer (Recommended — auto-installs WinFsp)
-Build `dist\TeleMount-Setup.exe` (bundles `telemount.exe` + official signed WinFsp MSI and silently installs WinFsp if missing):
-```powershell
-# Install Inno Setup 6 once (user scope, no admin required):
-winget install --id JRSoftware.InnoSetup --scope user
+Windows uses the **Setup Installer** (no portable `.exe` build) so WinFsp, Windows Explorer right-click menus, startup integration, and automatic GitHub updates work seamlessly:
 
-# Build dist\TeleMount-Setup.exe:
-powershell -ExecutionPolicy Bypass -File .\scripts\build-installer.ps1
-```
-Run `dist\TeleMount-Setup.exe` — it installs WinFsp automatically if not present, installs TeleMount, registers Start Menu / optional Desktop & Startup shortcuts, and launches TeleMount directly in your normal desktop session.
-
-### Option B: Standalone Portable Binary (`telemount.exe`)
-1. **Install WinFsp** once: `winget install WinFsp.WinFsp` (or download from [winfsp.dev/rel/](https://winfsp.dev/rel/)).
-2. **Build `telemount.exe`** (pure Go, no CGO/GCC needed):
+1. **Download `TeleMount-Setup-v*-windows-amd64.exe`** from [GitHub Releases](https://github.com/h2yq2a2g/TeleMount/releases/latest) — or build locally:
    ```powershell
-   $env:CGO_ENABLED="0"; $env:GOOS="windows"; $env:GOARCH="amd64"
-   go build -trimpath -ldflags="-s -w -H=windowsgui" -o telemount.exe ./cmd/telemount
+   # Install Inno Setup 6 once (user scope, no admin required):
+   winget install --id JRSoftware.InnoSetup --scope user
+
+   # Build dist\TeleMount-Setup.exe (bundles signed WinFsp MSI):
+   powershell -ExecutionPolicy Bypass -File .\scripts\build-installer.ps1
    ```
-3. **Use TeleMount on Windows**:
-   - First launch opens the local Web UI (`http://127.0.0.1:8080`) for the 4-step Setup Wizard (Admin → Telegram → Private Channel → Encryption Key — no WebDAV/rclone step on Windows) and auto-mounts drive `V:` right away.
-   - **Left-click** the TeleMount icon in the Windows taskbar/system tray anytime to open the Web UI and configure drive letter (`V:`), disk cache limit (default `10 GB`), pinned offline paths, and Windows startup.
-   - **Right-click** the tray icon for Mount/Unmount, Open Drive, Open Web UI, Run at Startup, and Clean Quit (flushes pending writes before exiting).
+2. **Run `TeleMount-Setup.exe`**:
+   - Automatically installs WinFsp if missing, registers Start Menu / optional Desktop & Startup shortcuts, and launches TeleMount in your normal desktop session.
+   - First launch opens the local Web UI (`http://127.0.0.1:8080`) for the 4-step Setup Wizard (Admin → Telegram → Private Channel → Encryption Key) and auto-mounts drive `V:`.
+   - **Left-click** the TeleMount icon in the Windows taskbar/system tray anytime to open the Web UI; **right-click** for Mount/Unmount, Open Drive, Check for Updates, Run at Startup, and Clean Quit.
+   - **Right-click any file or folder inside `V:`** (Windows 11: *Show more options* / `Shift + Right-click`) → **TeleMount** for OneDrive-style **Always keep on this device (Offline)** and **Free up space (Cloud only)**.
+   - **Auto-update**: Automatically checks GitHub Releases on startup and every 6 hours, verifies `SHA256SUMS.txt` before installing, and silently upgrades & relaunches when a new version is published.
 
 ## Quick Start — Linux VPS / Portainer (Docker)
 
@@ -100,7 +94,7 @@ go test -tags e2e ./e2e/...
 
 ## Automated Releases (GitHub Actions)
 
-Push a version tag to build and publish **Windows Setup (`TeleMount-Setup-*.exe` with bundled WinFsp)**, portable Windows/Linux binaries, `SHA256SUMS.txt`, and multi-arch Docker images (`linux/amd64`, `linux/arm64`) on GHCR:
+Push a version tag to build and publish **Windows Setup (`TeleMount-Setup-*.exe` with bundled WinFsp)**, Linux server binaries (`amd64`/`arm64`), `SHA256SUMS.txt`, and multi-arch Docker images (`linux/amd64`, `linux/arm64`) on GHCR:
 
 ```bash
 git tag v1.0.0

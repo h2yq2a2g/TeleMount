@@ -11,6 +11,7 @@ import (
 
 type DesktopStatus struct {
 	Enabled              bool     `json:"enabled"`
+	AppVersion           string   `json:"app_version,omitempty"`
 	WinFspInstalled      bool     `json:"winfsp_installed"`
 	WinFspGuidance       string   `json:"winfsp_guidance"`
 	DriveLetter          string   `json:"drive_letter"`
@@ -18,6 +19,11 @@ type DesktopStatus struct {
 	MountError           string   `json:"mount_error"`
 	RunAtStartup         bool     `json:"run_at_startup"`
 	AutoMount            bool     `json:"auto_mount"`
+	AutoUpdate           bool     `json:"auto_update"`
+	UpdateAvailable      bool     `json:"update_available"`
+	LatestVersion        string   `json:"latest_version,omitempty"`
+	ReleaseURL           string   `json:"release_url,omitempty"`
+	UpdateError          string   `json:"update_error,omitempty"`
 	DiskCacheMaxBytes    int64    `json:"disk_cache_max_bytes"`
 	DiskCacheBytes       int64    `json:"disk_cache_bytes"`
 	DiskCachePinnedBytes int64    `json:"disk_cache_pinned_bytes"`
@@ -35,6 +41,7 @@ type DesktopSettingsUpdate struct {
 	PinnedPaths       *[]string `json:"pinned_paths"`
 	RunAtStartup      *bool     `json:"run_at_startup"`
 	AutoMount         *bool     `json:"auto_mount"`
+	AutoUpdate        *bool     `json:"auto_update"`
 }
 
 type DesktopController interface {
@@ -55,6 +62,12 @@ type ShellActionResult struct {
 // ShellActionHandler is an optional extension of DesktopController for Windows Explorer context menu actions.
 type ShellActionHandler interface {
 	HandleShellAction(ctx context.Context, action, virtualPath string) (ShellActionResult, error)
+}
+
+// UpdateHandler is an optional extension of DesktopController for GitHub Releases auto-update.
+type UpdateHandler interface {
+	CheckUpdate(ctx context.Context) (DesktopStatus, error)
+	ApplyUpdate(ctx context.Context) error
 }
 
 func (s *Server) SetDesktopController(ctrl DesktopController) {
@@ -309,4 +322,44 @@ func (s *Server) handleDesktopShellAction(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleDesktopUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	ctrl := s.desktop()
+	if ctrl == nil {
+		writeErr(w, http.StatusServiceUnavailable, "desktop mode is not enabled")
+		return
+	}
+	upd, ok := ctrl.(UpdateHandler)
+	if !ok {
+		writeErr(w, http.StatusNotImplemented, "auto-update is not supported")
+		return
+	}
+	st, err := upd.CheckUpdate(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"status": normalizeStatus(st),
+	})
+}
+
+func (s *Server) handleDesktopUpdateApply(w http.ResponseWriter, r *http.Request) {
+	ctrl := s.desktop()
+	if ctrl == nil {
+		writeErr(w, http.StatusServiceUnavailable, "desktop mode is not enabled")
+		return
+	}
+	upd, ok := ctrl.(UpdateHandler)
+	if !ok {
+		writeErr(w, http.StatusNotImplemented, "auto-update is not supported")
+		return
+	}
+	if err := upd.ApplyUpdate(r.Context()); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

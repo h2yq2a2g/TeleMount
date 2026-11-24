@@ -66,7 +66,7 @@ jobs:
             choco install innosetup -y --no-progress
           }
 
-      - name: Build Windows Setup and portable binaries
+      - name: Build Windows Setup and Linux server binaries
         shell: pwsh
         env:
           TAG: ${{ steps.meta.outputs.tag }}
@@ -75,17 +75,16 @@ jobs:
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
 
-          # 1. Windows GUI Setup installer (bundles telemount.exe + signed WinFsp MSI)
+          # 1. Windows Setup installer only (no portable Windows build; bundles telemount.exe + signed WinFsp MSI)
           powershell -ExecutionPolicy Bypass -File .\scripts\build-installer.ps1 -Version $env:VERSION
           Copy-Item .\dist\TeleMount-Setup.exe "release-assets\TeleMount-Setup-$($env:TAG)-windows-amd64.exe"
-          Copy-Item .\dist\telemount.exe "release-assets\telemount-$($env:TAG)-windows-amd64.exe"
 
-          # 2. Pure-Go static Linux binaries (amd64 + arm64)
+          # 2. Pure-Go static Linux server binaries (amd64 + arm64)
           $env:CGO_ENABLED = "0"
           $env:GOOS = "linux"
           foreach ($arch in @("amd64", "arm64")) {
             $env:GOARCH = $arch
-            go build -trimpath -ldflags="-s -w" -o "release-assets\telemount-$($env:TAG)-linux-$arch" ./cmd/telemount
+            go build -trimpath -ldflags="-s -w -X telemount/internal/version.Version=$($env:TAG)" -o "release-assets\telemount-$($env:TAG)-linux-$arch" ./cmd/telemount
             if ($LASTEXITCODE -ne 0) { throw "linux/$arch build failed" }
           }
 
@@ -143,6 +142,7 @@ jobs:
           IMAGE="ghcr.io/${OWNER_LOWER}/telemount"
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
+            --build-arg "VERSION=${TAG}" \
             --push \
             -t "${IMAGE}:${TAG}" \
             -t "${IMAGE}:latest" \

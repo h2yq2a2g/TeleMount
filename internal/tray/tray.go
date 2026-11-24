@@ -27,6 +27,7 @@ const (
 	MenuIDOpenWebUI     uint16 = 1004
 	MenuIDToggleStartup uint16 = 1005
 	MenuIDQuit          uint16 = 1006
+	MenuIDCheckUpdate   uint16 = 1007
 )
 
 type TrayStatus struct {
@@ -37,6 +38,13 @@ type TrayStatus struct {
 	RunAtStartup    bool   `json:"run_at_startup"`
 	QueuePending    int    `json:"queue_pending"`
 	Online          bool   `json:"online"`
+	UpdateAvailable bool   `json:"update_available"`
+	LatestVersion   string `json:"latest_version"`
+}
+
+// TrayUpdater is an optional extension of TrayActions for checking/applying updates from the tray menu.
+type TrayUpdater interface {
+	TriggerUpdate() error
 }
 
 type TrayActions interface {
@@ -120,6 +128,11 @@ func BuildMenuItems(status TrayStatus) []MenuItem {
 		mountEnabled = true
 	}
 
+	updateLabel := "Check for Updates..."
+	if status.UpdateAvailable && status.LatestVersion != "" {
+		updateLabel = fmt.Sprintf("Update to %s...", status.LatestVersion)
+	}
+
 	return []MenuItem{
 		{
 			ID:      MenuIDStatus,
@@ -148,6 +161,11 @@ func BuildMenuItems(status TrayStatus) []MenuItem {
 			Label:   "Run at Windows Startup",
 			Enabled: true,
 			Checked: status.RunAtStartup,
+		},
+		{
+			ID:      MenuIDCheckUpdate,
+			Label:   updateLabel,
+			Enabled: true,
 		},
 		{Separator: true},
 		{
@@ -245,6 +263,14 @@ func DispatchMenuAction(id uint16, actions TrayActions, notifier Notifier) (quit
 		if _, err := actions.ToggleStartup(); err != nil {
 			notifyErr(err)
 			return false, err
+		}
+		return false, nil
+	case MenuIDCheckUpdate:
+		if upd, ok := actions.(TrayUpdater); ok {
+			if err := upd.TriggerUpdate(); err != nil {
+				notifyErr(err)
+				return false, err
+			}
 		}
 		return false, nil
 	case MenuIDQuit:

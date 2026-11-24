@@ -104,6 +104,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/desktop/open", s.requireAdmin(s.handleDesktopOpen))
 	s.mux.HandleFunc("POST /api/desktop/cache/clear", s.requireAdmin(s.handleDesktopCacheClear))
 	s.mux.HandleFunc("POST /api/desktop/queue/flush", s.requireAdmin(s.handleDesktopQueueFlush))
+	s.mux.HandleFunc("POST /api/desktop/update/check", s.requireAdmin(s.handleDesktopUpdateCheck))
+	s.mux.HandleFunc("POST /api/desktop/update/apply", s.requireAdmin(s.handleDesktopUpdateApply))
 	s.mux.HandleFunc("POST /api/desktop/shell-action", s.handleDesktopShellAction)
 
 	// Multi-account Telegram Backup Mirroring

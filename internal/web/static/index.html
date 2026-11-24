@@ -242,11 +242,25 @@
           </div>
         </div>
 
+        <!-- Desktop Auto-Update Banner -->
+        <div id="desktop-update-banner" class="alert alert-info hidden">
+          <div class="row-between" style="flex-wrap:wrap">
+            <div>
+              <strong id="desktop-update-title">Có phiên bản TeleMount mới!</strong>
+              <div id="desktop-update-desc" class="small"></div>
+            </div>
+            <div class="row-inline">
+              <a id="desktop-update-link" class="btn btn-ghost small-btn" href="#" target="_blank" rel="noreferrer">Chi tiết</a>
+              <button type="button" class="btn btn-primary small-btn" id="btn-desktop-apply-update">Cập nhật ngay</button>
+            </div>
+          </div>
+        </div>
+
         <!-- Desktop Virtual Drive Control Card -->
         <div id="desktop-drive-card" class="card hidden">
           <div class="row-between" style="flex-wrap:wrap">
             <div>
-              <h3 style="margin-bottom:4px">Ổ đĩa ảo Windows (Virtual Drive)</h3>
+              <h3 style="margin-bottom:4px">Ổ đĩa ảo Windows (Virtual Drive) <span class="muted small" id="desktop-app-version"></span></h3>
               <div class="small">
                 Ổ đĩa <strong id="desktop-drive-letter">V:</strong> ·
                 <span class="status-pill" id="desktop-mount-badge">—</span>
@@ -257,6 +271,7 @@
               <button type="button" class="btn btn-primary" id="btn-desktop-mount">Gắn ổ đĩa (Mount)</button>
               <button type="button" class="btn btn-secondary" id="btn-desktop-unmount">Ngắt ổ đĩa (Unmount)</button>
               <button type="button" class="btn btn-secondary" id="btn-desktop-open">Mở ổ đĩa</button>
+              <button type="button" class="btn btn-ghost small-btn" id="btn-desktop-check-update">Kiểm tra cập nhật</button>
             </div>
           </div>
           <div id="desktop-mount-error" class="alert alert-err hidden" style="margin-top:10px;margin-bottom:0"></div>
@@ -413,6 +428,10 @@
             <label class="checkbox-row">
               <input type="checkbox" id="set-desktop-automount" />
               <span>Tự động gắn ổ đĩa ảo khi khởi động (Auto-mount)</span>
+            </label>
+            <label class="checkbox-row">
+              <input type="checkbox" id="set-desktop-autoupdate" />
+              <span>Tự động kiểm tra &amp; cập nhật khi có phiên bản mới trên GitHub</span>
             </label>
             <div>
               <button type="submit" class="btn btn-primary" id="btn-save-desktop-settings">Lưu cài đặt Desktop</button>

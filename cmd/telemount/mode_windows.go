@@ -28,6 +28,7 @@ import (
 	"telemount/internal/storage"
 	"telemount/internal/tg"
 	"telemount/internal/tray"
+	"telemount/internal/version"
 	"telemount/internal/vfs"
 	"telemount/internal/web"
 )
@@ -117,6 +118,18 @@ func runPlatform(
 		return
 	}
 
+	exePath, _ := os.Executable()
+	// Release Windows builds require installation via TeleMount-Setup.exe (no portable mode).
+	if version.Version != "dev" && exePath != "" {
+		if _, err := os.Stat(filepath.Join(filepath.Dir(exePath), "unins000.exe")); err != nil {
+			_ = tray.NewDialogNotifier().ShowWarningDialog(
+				"TeleMount — Yêu cầu cài đặt",
+				"TeleMount không hỗ trợ chạy bản portable.\nVui lòng cài đặt bằng TeleMount-Setup.exe để dùng đầy đủ WinFsp, menu chuột phải và tự động cập nhật.",
+			)
+			return
+		}
+	}
+
 	cfgStore, err := desktop.LoadConfig("", dataDir)
 	if err != nil {
 		log.Fatalf("load desktop config: %v", err)
@@ -146,7 +159,6 @@ func runPlatform(
 	}
 	cache.StartSyncLoop(appCtx, 5*time.Second)
 
-	exePath, _ := os.Executable()
 	probe := desktop.NewWinFspProbe()
 	driveChecker := desktop.NewDriveChecker()
 	startupMgr := desktop.NewStartupManager(nil, "TeleMount")
@@ -234,6 +246,9 @@ func runPlatform(
 			_ = rt.OpenWebUI()
 		}
 
+		// Background GitHub Releases auto-update check (15s after launch, then every 6 hours).
+		go rt.runAutoUpdateLoop(appCtx)
+
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -302,6 +317,12 @@ type desktopRuntime struct {
 	trayMu   sync.RWMutex
 	trayApp  *tray.App
 	quitOnce sync.Once
+
+	updateMu       sync.Mutex
+	updateInfo     *desktop.UpdateInfo
+	updateErr      string
+	updating       bool
+	promptedVer    string
 }
 
 func (r *desktopRuntime) syncShellIntegration(driveLetter string) {
@@ -357,8 +378,22 @@ func (r *desktopRuntime) Status() web.DesktopStatus {
 		runAtStartup = enabled
 	}
 
+	r.updateMu.Lock()
+	uInfo := r.updateInfo
+	uErr := r.updateErr
+	r.updateMu.Unlock()
+
+	var updAvail bool
+	var latestVer, relURL string
+	if uInfo != nil {
+		updAvail = uInfo.Available
+		latestVer = uInfo.LatestVersion
+		relURL = uInfo.ReleaseURL
+	}
+
 	return web.DesktopStatus{
 		Enabled:              true,
+		AppVersion:           version.Version,
 		WinFspInstalled:      wf.Installed,
 		WinFspGuidance:       wf.Guidance,
 		DriveLetter:          drive,
@@ -366,6 +401,11 @@ func (r *desktopRuntime) Status() web.DesktopStatus {
 		MountError:           mountErr,
 		RunAtStartup:         runAtStartup,
 		AutoMount:            cfg.AutoMount,
+		AutoUpdate:           cfg.AutoUpdate,
+		UpdateAvailable:      updAvail,
+		LatestVersion:        latestVer,
+		ReleaseURL:           relURL,
+		UpdateError:          uErr,
 		DiskCacheMaxBytes:    cfg.DiskCacheMaxBytes,
 		DiskCacheBytes:       cs.TotalBytes,
 		DiskCachePinnedBytes: cs.PinnedBytes,
@@ -410,6 +450,9 @@ func (r *desktopRuntime) UpdateSettings(u web.DesktopSettingsUpdate) (web.Deskto
 		}
 		if u.AutoMount != nil {
 			c.AutoMount = *u.AutoMount
+		}
+		if u.AutoUpdate != nil {
+			c.AutoUpdate = *u.AutoUpdate
 		}
 		return desktop.ValidateConfig(*c)
 	})
@@ -640,7 +683,175 @@ func (r *desktopRuntime) TrayStatus() tray.TrayStatus {
 		RunAtStartup:    st.RunAtStartup,
 		QueuePending:    st.QueuePendingCount,
 		Online:          r.engine.IsReady(),
+		UpdateAvailable: st.UpdateAvailable,
+		LatestVersion:   st.LatestVersion,
 	}
+}
+
+func (r *desktopRuntime) runAutoUpdateLoop(ctx context.Context) {
+	select {
+	case <-time.After(15 * time.Second):
+	case <-ctx.Done():
+		return
+	}
+	r.autoCheckOnce(ctx)
+
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.autoCheckOnce(ctx)
+		}
+	}
+}
+
+func (r *desktopRuntime) autoCheckOnce(ctx context.Context) {
+	if _, err := r.CheckUpdate(ctx); err != nil {
+		return
+	}
+	r.updateMu.Lock()
+	info := r.updateInfo
+	alreadyPrompted := info != nil && r.promptedVer == info.LatestVersion
+	r.updateMu.Unlock()
+	if info == nil || !info.Available || alreadyPrompted {
+		return
+	}
+
+	// Pre-download and verify SHA-256 in the background so installation is instant.
+	dlCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	if _, err := desktop.DownloadAndVerifyInstaller(dlCtx, nil, filepath.Join(r.dataDir, "updates"), info); err != nil {
+		r.updateMu.Lock()
+		r.updateErr = err.Error()
+		r.updateMu.Unlock()
+		return
+	}
+
+	r.updateMu.Lock()
+	r.promptedVer = info.LatestVersion
+	r.updateMu.Unlock()
+	r.refreshTray()
+
+	if r.cfgStore.Get().AutoUpdate {
+		r.notifyTray("TeleMount — Tự động cập nhật", fmt.Sprintf("Đang cập nhật lên phiên bản %s...", info.LatestVersion), false)
+		if err := r.ApplyUpdate(ctx); err != nil && !errors.Is(err, desktop.ErrUpdateCanceled) {
+			r.notifyTray("TeleMount — Lỗi cập nhật", err.Error(), true)
+		}
+	} else {
+		r.notifyTray("TeleMount — Có bản cập nhật mới", fmt.Sprintf("Phiên bản %s đã sẵn sàng (đang dùng %s).", info.LatestVersion, version.Version), false)
+	}
+}
+
+func (r *desktopRuntime) CheckUpdate(ctx context.Context) (web.DesktopStatus, error) {
+	checkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	info, err := desktop.CheckLatestRelease(checkCtx, nil, desktop.DefaultGitHubAPIBase, version.GitHubRepo, version.Version)
+	r.updateMu.Lock()
+	if err != nil {
+		r.updateErr = err.Error()
+	} else {
+		r.updateInfo = info
+		r.updateErr = ""
+	}
+	r.updateMu.Unlock()
+	r.refreshTray()
+	return r.Status(), err
+}
+
+func (r *desktopRuntime) ApplyUpdate(ctx context.Context) error {
+	r.updateMu.Lock()
+	if r.updating {
+		r.updateMu.Unlock()
+		return errors.New("đang tiến hành cập nhật")
+	}
+	info := r.updateInfo
+	r.updating = true
+	r.updateMu.Unlock()
+
+	resetUpdating := true
+	defer func() {
+		if resetUpdating {
+			r.updateMu.Lock()
+			r.updating = false
+			r.updateMu.Unlock()
+		}
+	}()
+
+	if info == nil || !info.Available {
+		fresh, err := desktop.CheckLatestRelease(ctx, nil, desktop.DefaultGitHubAPIBase, version.GitHubRepo, version.Version)
+		if err != nil {
+			return err
+		}
+		r.updateMu.Lock()
+		r.updateInfo = fresh
+		r.updateMu.Unlock()
+		info = fresh
+	}
+	if !info.Available {
+		return fmt.Errorf("đang ở phiên bản mới nhất (%s)", version.Version)
+	}
+
+	dlCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	installerPath, err := desktop.DownloadAndVerifyInstaller(dlCtx, nil, filepath.Join(r.dataDir, "updates"), info)
+	if err != nil {
+		r.updateMu.Lock()
+		r.updateErr = err.Error()
+		r.updateMu.Unlock()
+		return err
+	}
+
+	// Safely unmount and flush pending writes BEFORE launching the silent upgrade installer.
+	wasMounted, prevDrive, _ := r.mountMgr.Status()
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_ = r.mountMgr.Unmount(flushCtx)
+	if r.engine.IsReady() {
+		_ = r.cache.FlushQueue(flushCtx)
+		_ = r.engine.Packer().FlushNow(flushCtx)
+	}
+	flushCancel()
+
+	if err := desktop.LaunchElevatedInstaller(installerPath); err != nil {
+		// If user declined UAC or launch failed, restore mount cleanly instead of quitting.
+		if wasMounted && prevDrive != "" {
+			_ = r.mountMgr.Mount(prevDrive)
+		}
+		r.refreshTray()
+		return err
+	}
+
+	resetUpdating = false
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		r.Quit()
+		r.trayMu.RLock()
+		app := r.trayApp
+		r.trayMu.RUnlock()
+		if app != nil {
+			_ = app.Close()
+		}
+	}()
+	return nil
+}
+
+func (r *desktopRuntime) TriggerUpdate() error {
+	st, err := r.CheckUpdate(context.Background())
+	if err != nil {
+		return err
+	}
+	if !st.UpdateAvailable {
+		r.notifyTray("TeleMount", fmt.Sprintf("Đang ở phiên bản mới nhất (%s).", version.Version), false)
+		return nil
+	}
+	r.notifyTray("TeleMount — Cập nhật", fmt.Sprintf("Đang tải và xác thực bản %s...", st.LatestVersion), false)
+	err = r.ApplyUpdate(context.Background())
+	if errors.Is(err, desktop.ErrUpdateCanceled) {
+		return nil
+	}
+	return err
 }
 
 func (r *desktopRuntime) OpenWebUI() error {
@@ -686,4 +897,5 @@ func (a *trayActionsAdapter) Unmount() error               { return a.rt.Unmount
 func (a *trayActionsAdapter) OpenDrive() error             { return a.rt.OpenDrive() }
 func (a *trayActionsAdapter) OpenWebUI() error             { return a.rt.OpenWebUI() }
 func (a *trayActionsAdapter) ToggleStartup() (bool, error) { return a.rt.ToggleStartup() }
+func (a *trayActionsAdapter) TriggerUpdate() error         { return a.rt.TriggerUpdate() }
 func (a *trayActionsAdapter) Quit()                        { a.rt.Quit() }

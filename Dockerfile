@@ -5,6 +5,7 @@ WORKDIR /src
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION=dev
 
 ENV CGO_ENABLED=0 \
     GOTOOLCHAIN=auto
@@ -13,7 +14,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/telemount ./cmd/telemount
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w -X telemount/internal/version.Version=${VERSION}" -o /out/telemount ./cmd/telemount
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata \
