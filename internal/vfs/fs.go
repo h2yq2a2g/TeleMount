@@ -33,6 +33,7 @@ type openHandle struct {
 	appendMode bool
 	stagedPath string
 	stagedFile *os.File
+	readStream *diskcache.ReadStream
 	dirty      bool
 	mtime      int64
 }
@@ -163,6 +164,10 @@ func (f *TeleFS) ensureStagedLocked(h *openHandle, truncate bool) error {
 	}
 	h.stagedPath = stPath
 	h.stagedFile = osf
+	if h.readStream != nil {
+		_ = h.readStream.Close()
+		h.readStream = nil
+	}
 	return nil
 }
 
@@ -209,6 +214,10 @@ func (f *TeleFS) flushHandleLocked(h *openHandle) int {
 }
 
 func (f *TeleFS) cleanupHandleFilesLocked(h *openHandle) {
+	if h.readStream != nil {
+		_ = h.readStream.Close()
+		h.readStream = nil
+	}
 	if h.stagedFile != nil {
 		_ = h.stagedFile.Close()
 		h.stagedFile = nil
@@ -529,6 +538,10 @@ func (f *TeleFS) Rename(oldpath, newpath string) int {
 			}
 		}
 		h.path = newNorm
+		if h.readStream != nil {
+			_ = h.readStream.Close()
+			h.readStream = f.cache.OpenReadStream(newNorm)
+		}
 		h.mu.Unlock()
 	}
 
@@ -668,10 +681,11 @@ func (f *TeleFS) Open(p string, flags int) (int, uint64) {
 	writable := accMode == fuse.O_WRONLY || accMode == fuse.O_RDWR || flags&fuse.O_TRUNC != 0 || flags&fuse.O_APPEND != 0
 	if !writable {
 		return 0, f.registerHandle(&openHandle{
-			path:     ov.Path,
-			flags:    flags,
-			writable: false,
-			mtime:    ov.Mtime,
+			path:       ov.Path,
+			flags:      flags,
+			writable:   false,
+			readStream: f.cache.OpenReadStream(ov.Path),
+			mtime:      ov.Mtime,
 		})
 	}
 
@@ -683,6 +697,7 @@ func (f *TeleFS) Open(p string, flags int) (int, uint64) {
 			flags:      flags,
 			writable:   true,
 			appendMode: flags&fuse.O_APPEND != 0,
+			readStream: f.cache.OpenReadStream(ov.Path),
 			dirty:      false,
 			mtime:      ov.Mtime,
 		})
@@ -719,6 +734,7 @@ func (f *TeleFS) Read(p string, buff []byte, ofst int64, fh uint64) int {
 	}
 
 	targetPath := diskcache.NormalizePath(p)
+	var rs *diskcache.ReadStream
 	if h := f.getHandle(fh); h != nil {
 		h.mu.Lock()
 		if h.stagedFile != nil {
@@ -730,10 +746,19 @@ func (f *TeleFS) Read(p string, buff []byte, ofst int64, fh uint64) int {
 			return n
 		}
 		targetPath = h.path
+		rs = h.readStream
 		h.mu.Unlock()
 	}
 
-	n, err := f.cache.ReadFileAt(context.Background(), targetPath, buff, ofst)
+	var (
+		n   int
+		err error
+	)
+	if rs != nil {
+		n, err = rs.ReadAt(context.Background(), buff, ofst)
+	} else {
+		n, err = f.cache.ReadFileAt(context.Background(), targetPath, buff, ofst)
+	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		return mapErr(err)
 	}

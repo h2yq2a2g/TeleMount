@@ -468,6 +468,13 @@ type FileReader struct {
 	cachedPlain    []byte
 	hasCachedBlock bool
 	cipherScratch  []byte
+
+	prefetchCtx    context.Context
+	prefetchCancel context.CancelFunc
+	prefetchWg     sync.WaitGroup
+	lastPartIdx    int
+	lastChunkIdx   int64
+	seqChunks      int
 }
 
 func (e *Engine) OpenFile(ctx context.Context, node *db.Node) (*FileReader, error) {
@@ -500,23 +507,32 @@ func (e *Engine) OpenFile(ctx context.Context, node *db.Node) (*FileReader, erro
 	if node.Size > 0 {
 		trID = e.tg.Tracker().StartTransfer("download", node.Name, node.Size)
 	}
+	prefetchCtx, prefetchCancel := context.WithCancel(ctx)
 
 	return &FileReader{
-		ctx:           ctx,
-		engine:        e,
-		node:          node,
-		parts:         parts,
-		partStarts:    starts,
-		decryptors:    decs,
-		trID:          trID,
-		cachedPartIdx: -1,
-		cipherScratch: make([]byte, crypto.CipherBlockSize),
+		ctx:            ctx,
+		engine:         e,
+		node:           node,
+		parts:          parts,
+		partStarts:     starts,
+		decryptors:     decs,
+		trID:           trID,
+		cachedPartIdx:  -1,
+		cipherScratch:  make([]byte, crypto.CipherBlockSize),
+		prefetchCtx:    prefetchCtx,
+		prefetchCancel: prefetchCancel,
+		lastPartIdx:    -1,
+		lastChunkIdx:   -1,
 	}, nil
 }
 
 func (fr *FileReader) Close() error {
 	if !fr.closed {
 		fr.closed = true
+		if fr.prefetchCancel != nil {
+			fr.prefetchCancel()
+		}
+		fr.prefetchWg.Wait()
 		if fr.trID != "" {
 			fr.engine.tg.Tracker().EndTransfer(fr.trID)
 		}
@@ -584,6 +600,7 @@ func (fr *FileReader) ReadAt(p []byte, off int64) (int, error) {
 				fr.cipherScratch = make([]byte, cLen)
 			}
 			cipherBuf := fr.cipherScratch[:cLen]
+			fr.recordAndPrefetch(partIdx, part, cOff)
 			if err := fr.engine.readPartCipherRaw(fr.ctx, part, cOff, cipherBuf); err != nil {
 				return totalRead, err
 			}
@@ -628,6 +645,44 @@ func (fr *FileReader) findPart(off int64) int {
 	return idx
 }
 
+func (fr *FileReader) recordAndPrefetch(partIdx int, part *db.FilePart, cipherOff int64) {
+	if part.TGMsgID <= 0 || part.CipherSize <= 0 || fr.prefetchCtx.Err() != nil {
+		return
+	}
+	chunkIdx := (part.PackOffset + cipherOff) / tg.TGChunkSize
+	if partIdx == fr.lastPartIdx && chunkIdx == fr.lastChunkIdx {
+		return
+	}
+	if partIdx == fr.lastPartIdx && chunkIdx == fr.lastChunkIdx+1 {
+		fr.seqChunks++
+	} else {
+		fr.seqChunks = 0
+	}
+	fr.lastPartIdx = partIdx
+	fr.lastChunkIdx = chunkIdx
+
+	// Start 4-chunk (2 MiB) async read-ahead once 3 consecutive chunks confirm sequential streaming.
+	if fr.seqChunks < 2 || fr.engine.cache.MaxBytes() < 8*tg.TGChunkSize {
+		return
+	}
+	maxChunk := (part.PackOffset + part.CipherSize - 1) / tg.TGChunkSize
+	for ahead := int64(1); ahead <= 4; ahead++ {
+		nextIdx := chunkIdx + ahead
+		if nextIdx > maxChunk {
+			break
+		}
+		if fr.engine.cache.HasOrInflight(part.TGMsgID, nextIdx) {
+			continue
+		}
+		partCopy := *part
+		fr.prefetchWg.Add(1)
+		go func(p db.FilePart, idx int64) {
+			defer fr.prefetchWg.Done()
+			_, _ = fr.engine.fetchPartChunk(fr.prefetchCtx, &p, idx)
+		}(partCopy, nextIdx)
+	}
+}
+
 // readPartCipherRaw reads ciphertext bytes [cipherOff : cipherOff+len(dst)] of a FilePart.
 // If the part belongs to an in-RAM Pack not yet flushed to Telegram (or still in memPacks), it serves directly from RAM;
 // otherwise it reads from PackOffset + cipherOff in the Telegram message via the aligned 512 KiB ChunkCache.
@@ -664,6 +719,10 @@ func (e *Engine) readPartCipherRaw(ctx context.Context, part *db.FilePart, ciphe
 		inChunkOff := int(pos % tg.TGChunkSize)
 
 		chunkData, err := e.fetchPartChunk(ctx, part, chunkIdx)
+		if err != nil && errors.Is(err, context.Canceled) && ctx.Err() == nil {
+			// Another reader cancelled its own prefetch for this chunk; retry once with our live ctx.
+			chunkData, err = e.fetchPartChunk(ctx, part, chunkIdx)
+		}
 		if err != nil {
 			return err
 		}

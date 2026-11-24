@@ -21,6 +21,10 @@ import (
 
 const DefaultMaxBytes int64 = 10 * 1024 * 1024 * 1024
 
+// DefaultStreamThreshold is the file size at or above which uncached cloud-only files
+// stream on demand via range-reads instead of downloading the entire file first.
+const DefaultStreamThreshold int64 = 4 * 1024 * 1024
+
 var ErrOfflineUncached = errors.New("offline and file not cached")
 
 type CacheStats struct {
@@ -56,9 +60,10 @@ type Manager struct {
 	statusMu    sync.Mutex
 	syncMu      sync.Mutex
 
-	maxBytes     int64
-	pinnedPaths  []string
-	lastAccessNS atomic.Int64
+	maxBytes        int64
+	streamThreshold int64
+	pinnedPaths     []string
+	lastAccessNS    atomic.Int64
 
 	blobMu              sync.Mutex
 	activeBlobReaders   map[string]int
@@ -120,6 +125,7 @@ func OpenWithBackend(cacheDir, dbPath string, maxBytes int64, store *db.Store, b
 		flushSem:            make(chan struct{}, 1),
 		flushWakeCh:         make(chan struct{}, 1),
 		maxBytes:            maxBytes,
+		streamThreshold:     DefaultStreamThreshold,
 		activeBlobReaders:   make(map[string]int),
 		deferredBlobDeletes: make(map[string]bool),
 		closeCh:             make(chan struct{}),
@@ -407,14 +413,32 @@ func (m *Manager) ListDir(dirPath string) ([]NodeOverlay, error) {
 	return m.listDirLocked(dirPath)
 }
 
-// ReadFileAt reads len(buf) bytes starting at offset, serving from dirty overlay -> clean disk cache -> online fetch.
+// ReadFileAt reads len(buf) bytes starting at offset, serving from dirty overlay -> clean disk cache -> online fetch/stream.
 func (m *Manager) ReadFileAt(ctx context.Context, p string, buf []byte, offset int64) (int, error) {
-	if offset < 0 {
-		return 0, fmt.Errorf("negative offset: %d", offset)
-	}
 	normPath := NormalizePath(p)
+	n, handled, rn, isPinned, maxBytes, err := m.resolveReadLocal(normPath, buf, offset)
+	if handled {
+		return n, err
+	}
+	if m.shouldStreamUncached(rn.Size, isPinned, maxBytes) {
+		return m.readOversizedUncached(ctx, rn.Path, rn.Size, buf, offset)
+	}
+	return m.readCachedAfterFetch(ctx, rn.Path, buf, offset)
+}
+
+func (m *Manager) shouldStreamUncached(size int64, isPinned bool, maxBytes int64) bool {
+	if m.streamThreshold > 0 && size >= m.streamThreshold {
+		return true
+	}
+	return !isPinned && maxBytes >= 0 && size > maxBytes
+}
+
+func (m *Manager) resolveReadLocal(normPath string, buf []byte, offset int64) (int, bool, *RemoteNode, bool, int64, error) {
+	if offset < 0 {
+		return 0, true, nil, false, 0, fmt.Errorf("negative offset: %d", offset)
+	}
 	if normPath == "/" {
-		return 0, os.ErrInvalid
+		return 0, true, nil, false, 0, os.ErrInvalid
 	}
 	pathLower := strings.ToLower(normPath)
 
@@ -422,24 +446,24 @@ func (m *Manager) ReadFileAt(ctx context.Context, p string, buf []byte, offset i
 	// Check ancestor tombstone first.
 	if ancDel, err := m.hasDeletedAncestorLocked(normPath); err != nil {
 		m.stateMu.Unlock()
-		return 0, err
+		return 0, true, nil, false, 0, err
 	} else if ancDel {
 		m.stateMu.Unlock()
-		return 0, os.ErrNotExist
+		return 0, true, nil, false, 0, os.ErrNotExist
 	}
 
 	// Priority 1: overlay_nodes (tombstone or dirty local file).
 	if ov, ok, err := m.getOverlayRow(pathLower); err != nil {
 		m.stateMu.Unlock()
-		return 0, err
+		return 0, true, nil, false, 0, err
 	} else if ok {
 		if ov.Deleted {
 			m.stateMu.Unlock()
-			return 0, os.ErrNotExist
+			return 0, true, nil, false, 0, os.ErrNotExist
 		}
 		if ov.IsDir {
 			m.stateMu.Unlock()
-			return 0, os.ErrInvalid
+			return 0, true, nil, false, 0, os.ErrInvalid
 		}
 		if ov.Dirty {
 			blobKey := ov.BlobKey
@@ -454,15 +478,16 @@ func (m *Manager) ReadFileAt(ctx context.Context, p string, buf []byte, offset i
 			m.stateMu.Unlock()
 
 			if size == 0 || offset >= size {
-				return 0, io.EOF
+				return 0, true, nil, false, 0, io.EOF
 			}
 			if len(buf) == 0 {
-				return 0, nil
+				return 0, true, nil, false, 0, nil
 			}
 			if !m.blobValid(blobKey, size) {
-				return 0, fmt.Errorf("dirty blob missing for %s", normPath)
+				return 0, true, nil, false, 0, fmt.Errorf("dirty blob missing for %s", normPath)
 			}
-			return m.readBlobAt(blobKey, size, buf, offset)
+			n, rerr := m.readBlobAt(blobKey, size, buf, offset)
+			return n, true, nil, false, 0, rerr
 		}
 	}
 
@@ -475,13 +500,13 @@ func (m *Manager) ReadFileAt(ctx context.Context, p string, buf []byte, offset i
 		rn, remoteFound, serr = m.backend.Stat(normPath)
 		if serr != nil {
 			m.stateMu.Unlock()
-			return 0, serr
+			return 0, true, nil, false, 0, serr
 		}
 	}
 
 	if ce, ceOk, err := m.getCacheEntry(pathLower); err != nil {
 		m.stateMu.Unlock()
-		return 0, err
+		return 0, true, nil, false, 0, err
 	} else if ceOk && !ce.Dirty {
 		stale := false
 		if m.backend != nil {
@@ -492,7 +517,7 @@ func (m *Manager) ReadFileAt(ctx context.Context, p string, buf []byte, offset i
 				staleBlobToDelete = ce.BlobKey
 				m.stateMu.Unlock()
 				m.scheduleBlobDeletes([]string{staleBlobToDelete})
-				return 0, os.ErrInvalid
+				return 0, true, nil, false, 0, os.ErrInvalid
 			} else {
 				stale = ce.RemoteETag != rn.ETag || ce.Size != rn.Size || (ce.RemoteNodeID != 0 && rn.ID != 0 && ce.RemoteNodeID != rn.ID)
 			}
@@ -505,12 +530,13 @@ func (m *Manager) ReadFileAt(ctx context.Context, p string, buf []byte, offset i
 			m.stateMu.Unlock()
 
 			if size == 0 || offset >= size {
-				return 0, io.EOF
+				return 0, true, nil, false, 0, io.EOF
 			}
 			if len(buf) == 0 {
-				return 0, nil
+				return 0, true, nil, false, 0, nil
 			}
-			return m.readBlobAt(blobKey, size, buf, offset)
+			n, rerr := m.readBlobAt(blobKey, size, buf, offset)
+			return n, true, nil, false, 0, rerr
 		}
 		// Stale or corrupt clean cache entry.
 		_, _ = m.db.Exec(`DELETE FROM cache_entries WHERE path_lower = ? AND dirty = 0`, pathLower)
@@ -520,17 +546,17 @@ func (m *Manager) ReadFileAt(ctx context.Context, p string, buf []byte, offset i
 	if m.backend == nil {
 		m.stateMu.Unlock()
 		m.scheduleBlobDeletes([]string{staleBlobToDelete})
-		return 0, os.ErrNotExist
+		return 0, true, nil, false, 0, os.ErrNotExist
 	}
 	if !remoteFound {
 		m.stateMu.Unlock()
 		m.scheduleBlobDeletes([]string{staleBlobToDelete})
-		return 0, os.ErrNotExist
+		return 0, true, nil, false, 0, os.ErrNotExist
 	}
 	if rn.IsDir {
 		m.stateMu.Unlock()
 		m.scheduleBlobDeletes([]string{staleBlobToDelete})
-		return 0, os.ErrInvalid
+		return 0, true, nil, false, 0, os.ErrInvalid
 	}
 	isPinned := m.isPinnedLocked(rn.Path)
 	maxBytes := m.maxBytes
@@ -542,15 +568,13 @@ func (m *Manager) ReadFileAt(ctx context.Context, p string, buf []byte, offset i
 
 	// Priority 3: online fetch.
 	if !m.backend.IsOnline() {
-		return 0, ErrOfflineUncached
+		return 0, true, nil, false, 0, ErrOfflineUncached
 	}
+	return 0, false, rn, isPinned, maxBytes, nil
+}
 
-	// Unpinned file larger than maxBytes: serve without retaining in cache_entries so TotalBytes <= MaxBytes holds.
-	if !isPinned && maxBytes >= 0 && rn.Size > maxBytes {
-		return m.readOversizedUncached(ctx, rn.Path, rn.Size, buf, offset)
-	}
-
-	ce, err := m.ensureCachedSingleflight(ctx, rn.Path)
+func (m *Manager) readCachedAfterFetch(ctx context.Context, normPath string, buf []byte, offset int64) (int, error) {
+	ce, err := m.ensureCachedSingleflight(ctx, normPath)
 	if err != nil {
 		return 0, err
 	}
@@ -562,9 +586,144 @@ func (m *Manager) ReadFileAt(ctx context.Context, p string, buf []byte, offset i
 	}
 	n, err := m.readBlobAt(ce.BlobKey, ce.Size, buf, offset)
 	if errors.Is(err, os.ErrNotExist) {
-		return m.readOversizedUncached(ctx, rn.Path, ce.Size, buf, offset)
+		return m.readOversizedUncached(ctx, normPath, ce.Size, buf, offset)
 	}
 	return n, err
+}
+
+// ReadStream holds a reusable range-capable remote reader for one open VFS file handle,
+// preserving FileReader block caching, transfer reporting, and sequential read-ahead across Reads.
+type ReadStream struct {
+	mgr    *Manager
+	path   string
+	mu     sync.Mutex
+	rc     io.ReadCloser
+	ra     io.ReaderAt
+	size   int64
+	etag   string
+	closed bool
+}
+
+// OpenReadStream returns a lazy handle-scoped reader for VFS streaming reads.
+func (m *Manager) OpenReadStream(virtualPath string) *ReadStream {
+	return &ReadStream{
+		mgr:  m,
+		path: NormalizePath(virtualPath),
+	}
+}
+
+func (rs *ReadStream) Close() error {
+	if rs == nil {
+		return nil
+	}
+	rs.mu.Lock()
+	rs.closed = true
+	rc := rs.rc
+	rs.rc = nil
+	rs.ra = nil
+	rs.mu.Unlock()
+	if rc != nil {
+		return rc.Close()
+	}
+	return nil
+}
+
+func (rs *ReadStream) resetLocked() {
+	if rs.rc != nil {
+		_ = rs.rc.Close()
+		rs.rc = nil
+		rs.ra = nil
+		rs.size = 0
+		rs.etag = ""
+	}
+}
+
+func (rs *ReadStream) ReadAt(ctx context.Context, buf []byte, offset int64) (int, error) {
+	if rs == nil {
+		return 0, os.ErrInvalid
+	}
+	n, handled, rn, isPinned, maxBytes, err := rs.mgr.resolveReadLocal(rs.path, buf, offset)
+	if handled {
+		rs.mu.Lock()
+		rs.resetLocked()
+		rs.mu.Unlock()
+		return n, err
+	}
+	if !rs.mgr.shouldStreamUncached(rn.Size, isPinned, maxBytes) {
+		rs.mu.Lock()
+		rs.resetLocked()
+		rs.mu.Unlock()
+		return rs.mgr.readCachedAfterFetch(ctx, rn.Path, buf, offset)
+	}
+	if rn.Size == 0 || offset >= rn.Size {
+		return 0, io.EOF
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.closed {
+		return 0, os.ErrClosed
+	}
+	if rs.rc == nil || rs.etag != rn.ETag || rs.size != rn.Size {
+		rs.resetLocked()
+		rc, remoteSize, _, oerr := rs.mgr.backend.OpenReader(ctx, rn.Path)
+		if oerr != nil {
+			return 0, oerr
+		}
+		ra, ok := rc.(io.ReaderAt)
+		if !ok {
+			_ = rc.Close()
+			return rs.mgr.readOversizedUncached(ctx, rn.Path, rn.Size, buf, offset)
+		}
+		effSize := rn.Size
+		if remoteSize >= 0 {
+			effSize = remoteSize
+		}
+		rs.rc = rc
+		rs.ra = ra
+		rs.size = effSize
+		rs.etag = rn.ETag
+	}
+
+	if rs.size == 0 || offset >= rs.size {
+		return 0, io.EOF
+	}
+	n, rerr := readAllAt(rs.ra, rs.size, buf, offset)
+	if rerr != nil && !errors.Is(rerr, io.EOF) {
+		rs.resetLocked()
+	}
+	return n, rerr
+}
+
+func readAllAt(ra io.ReaderAt, size int64, buf []byte, offset int64) (int, error) {
+	want := len(buf)
+	if rem := size - offset; int64(want) > rem {
+		want = int(rem)
+	}
+	total := 0
+	for total < want {
+		n, rerr := ra.ReadAt(buf[total:want], offset+int64(total))
+		total += n
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				if total < len(buf) {
+					return total, io.EOF
+				}
+				return total, nil
+			}
+			return total, rerr
+		}
+		if n == 0 {
+			break
+		}
+	}
+	if total < len(buf) {
+		return total, io.EOF
+	}
+	return total, nil
 }
 
 func (m *Manager) readOversizedUncached(ctx context.Context, normPath string, size int64, buf []byte, offset int64) (int, error) {
@@ -588,31 +747,7 @@ func (m *Manager) readOversizedUncached(ctx context.Context, normPath string, si
 	}
 
 	if ra, ok := rc.(io.ReaderAt); ok {
-		want := len(buf)
-		if rem := size - offset; int64(want) > rem {
-			want = int(rem)
-		}
-		total := 0
-		for total < want {
-			n, rerr := ra.ReadAt(buf[total:want], offset+int64(total))
-			total += n
-			if rerr != nil {
-				if errors.Is(rerr, io.EOF) {
-					if total < len(buf) {
-						return total, io.EOF
-					}
-					return total, nil
-				}
-				return total, rerr
-			}
-			if n == 0 {
-				break
-			}
-		}
-		if total < len(buf) {
-			return total, io.EOF
-		}
-		return total, nil
+		return readAllAt(ra, size, buf, offset)
 	}
 
 	if err := ensureCacheDirs(m.cacheDir); err != nil {

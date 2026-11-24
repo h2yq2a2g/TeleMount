@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"telemount/internal/crypto"
 	"telemount/internal/db"
@@ -554,6 +555,68 @@ func TestMultiAccountMirrorFailoverAndDisasterRestore(t *testing.T) {
 	frB.Close()
 	if err != nil || !bytes.Equal(gotB, dataB) {
 		t.Fatalf("decrypted file B after fresh VPS restore from Backup Channel mismatch: id=%d err=%v", nodeB.ID, err)
+	}
+}
+
+func TestFileReaderSequentialReadAheadAndCleanClose(t *testing.T) {
+	dir := t.TempDir()
+	store, err := db.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt, _ := crypto.NewSalt()
+	key := crypto.DeriveMasterKey("secret-pass", salt)
+	_ = st.SetAdmin("admin", "pass1234")
+	_ = st.SetMasterKey(key, salt)
+	_ = st.SetChannel(1001, 2002, "StreamChan")
+	mock := newMockTG()
+	eng := NewEngine(store, st, mock, filepath.Join(dir, "tmp"))
+
+	// 4 MiB file = ~8 aligned 512 KiB Telegram chunks.
+	payload := make([]byte, 4<<20)
+	for i := range payload {
+		payload[i] = byte((i * 29) % 253)
+	}
+	ctx := context.Background()
+	node, err := eng.UploadFile(ctx, db.RootID, "movie.mkv", "video/x-matroska", bytes.NewReader(payload), int64(len(payload)))
+	if err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+	if err := eng.Packer().FlushNow(ctx); err != nil {
+		t.Fatalf("FlushNow: %v", err)
+	}
+
+	fr, err := eng.OpenFile(ctx, node)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	// Read first 1.5 MiB sequentially (chunks 0, 1, 2) -> triggers 4-chunk async read-ahead (chunks 3..6).
+	buf := make([]byte, 1536*1024)
+	if n, err := io.ReadFull(fr, buf); err != nil || n != len(buf) || !bytes.Equal(buf, payload[:len(buf)]) {
+		_ = fr.Close()
+		t.Fatalf("sequential read failed: n=%d err=%v", n, err)
+	}
+
+	// Wait briefly for read-ahead goroutines to populate ChunkCache beyond the 3 chunks read.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if eng.Cache().Stats().Entries >= 5 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if entries := eng.Cache().Stats().Entries; entries < 5 {
+		_ = fr.Close()
+		t.Fatalf("expected sequential read-ahead to populate >= 5 cached chunks, got %d", entries)
+	}
+	if err := fr.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }
 

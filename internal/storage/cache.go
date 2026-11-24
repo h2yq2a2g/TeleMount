@@ -140,6 +140,27 @@ func (c *ChunkCache) SetMaxBytes(maxBytes int64) {
 	c.mu.Unlock()
 }
 
+func (c *ChunkCache) MaxBytes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.maxBytes
+}
+
+// HasOrInflight reports whether the chunk is already in RAM or currently being fetched.
+func (c *ChunkCache) HasOrInflight(msgID int, chunkIdx int64) bool {
+	key := chunkKey{msgID: msgID, chunkIdx: chunkIdx}
+	c.mu.Lock()
+	_, cached := c.items[key]
+	c.mu.Unlock()
+	if cached {
+		return true
+	}
+	c.flightMu.Lock()
+	_, flying := c.inflight[key]
+	c.flightMu.Unlock()
+	return flying
+}
+
 func (c *ChunkCache) Clear() {
 	c.mu.Lock()
 	c.ll.Init()

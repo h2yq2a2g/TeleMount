@@ -1239,4 +1239,114 @@ func TestOverlayStateAndOnChange(t *testing.T) {
 	}
 }
 
+func TestLargeCloudFileStreamsOnDemandWithoutFullDownload(t *testing.T) {
+	store, eng, mtg := setupTestEngine(t)
+	ctx := context.Background()
+
+	moviesDir, err := store.MkdirAll("/movies")
+	if err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// 5 MiB file (>= DefaultStreamThreshold 4 MiB, 10+ Telegram 512 KiB chunks).
+	payload := make([]byte, 5<<20)
+	for i := range payload {
+		payload[i] = byte((i*17 + i/257) % 251)
+	}
+	if _, err := eng.UploadFile(ctx, moviesDir.ID, "demo.mp4", "video/mp4", bytes.NewReader(payload), int64(len(payload))); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+	if err := eng.Packer().FlushNow(ctx); err != nil {
+		t.Fatalf("FlushNow: %v", err)
+	}
+
+	dir := t.TempDir()
+	mgr, err := Open(filepath.Join(dir, "cache"), filepath.Join(dir, "desktop_cache.db"), DefaultMaxBytes, store, eng)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer mgr.Close()
+
+	// Simulate VLC opening MP4: read header (offset 0) and moov atom near EOF via reusable ReadStream.
+	rs := mgr.OpenReadStream("/movies/demo.mp4")
+	defer rs.Close()
+
+	head := make([]byte, 4096)
+	if n, err := rs.ReadAt(ctx, head, 0); err != nil || n != len(head) || !bytes.Equal(head, payload[:4096]) {
+		t.Fatalf("header read = (%d, %v)", n, err)
+	}
+	tailOff := int64(len(payload) - 8192)
+	tail := make([]byte, 4096)
+	if n, err := rs.ReadAt(ctx, tail, tailOff); err != nil || n != len(tail) || !bytes.Equal(tail, payload[tailOff:tailOff+4096]) {
+		t.Fatalf("tail seek read = (%d, %v)", n, err)
+	}
+
+	mtg.mu.Lock()
+	fetches := mtg.fetches
+	mtg.mu.Unlock()
+	if fetches < 2 || fetches > 3 {
+		t.Fatalf("expected on-demand range stream (2..3 TG chunk fetches for head+tail), got %d fetches", fetches)
+	}
+	if st := mgr.Stats(); st.EntryCount != 0 || st.TotalBytes != 0 {
+		t.Fatalf("expected streamed cloud file not to dump full blob into disk cache, got %+v", st)
+	}
+	if ov := mgr.OverlayState("/movies/demo.mp4"); ov != OverlayCloud {
+		t.Fatalf("OverlayState = %c, want %c", ov, OverlayCloud)
+	}
+
+	// Explicit PinSync still downloads into local disk cache, after which ReadStream serves offline!
+	if err := mgr.SetPinnedPaths([]string{"/movies/demo.mp4"}); err != nil {
+		t.Fatalf("SetPinnedPaths: %v", err)
+	}
+	if err := mgr.PinSync(ctx, "/movies/demo.mp4"); err != nil {
+		t.Fatalf("PinSync: %v", err)
+	}
+	mtg.SetAuthorized(false)
+	eng.Cache().Clear()
+
+	midOff := int64(2<<20 + 123)
+	mid := make([]byte, 4096)
+	if n, err := rs.ReadAt(ctx, mid, midOff); err != nil || n != len(mid) || !bytes.Equal(mid, payload[midOff:midOff+4096]) {
+		t.Fatalf("offline read after PinSync = (%d, %v)", n, err)
+	}
+}
+
+func TestReadStreamReusesSingleBackendReaderAcrossSeeksAndETagInvalidation(t *testing.T) {
+	dir := t.TempDir()
+	fb := newFakeBackend(true)
+	payload1 := bytes.Repeat([]byte("S"), 1024)
+	payload2 := bytes.Repeat([]byte("T"), 1024)
+	fb.PutFile("/video.mkv", payload1, "etag-1")
+
+	mgr, err := OpenWithBackend(filepath.Join(dir, "cache"), filepath.Join(dir, "cache.db"), DefaultMaxBytes, nil, fb)
+	if err != nil {
+		t.Fatalf("OpenWithBackend: %v", err)
+	}
+	defer mgr.Close()
+	mgr.streamThreshold = 512
+
+	rs := mgr.OpenReadStream("/video.mkv")
+	defer rs.Close()
+
+	ctx := context.Background()
+	buf := make([]byte, 64)
+	for _, off := range []int64{0, 512, 960, 128} {
+		n, err := rs.ReadAt(ctx, buf, off)
+		if err != nil || n != 64 || !bytes.Equal(buf, payload1[off:off+64]) {
+			t.Fatalf("ReadAt(%d) = (%d, %v)", off, n, err)
+		}
+	}
+	if fb.readCount.Load() != 1 {
+		t.Fatalf("expected ReadStream to open backend reader once across 4 seeks, got %d", fb.readCount.Load())
+	}
+
+	// Remote ETag change must transparently re-open the stream reader with fresh content.
+	fb.PutFile("/video.mkv", payload2, "etag-2")
+	if n, err := rs.ReadAt(ctx, buf, 0); err != nil || n != 64 || !bytes.Equal(buf, payload2[:64]) {
+		t.Fatalf("ReadAt after ETag change = (%d, %v)", n, err)
+	}
+	if fb.readCount.Load() != 2 {
+		t.Fatalf("expected re-open after ETag change (readCount=2), got %d", fb.readCount.Load())
+	}
+}
+
 
