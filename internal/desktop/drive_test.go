@@ -108,4 +108,15 @@ func TestListAvailableDrives(t *testing.T) {
 	if len(gotA) == 0 || gotA[0] != "A:" {
 		t.Fatalf("expected configured A: preserved first, got %v", gotA)
 	}
+
+	// ListUsedDrives returns occupied drives excluding TeleMount's own active mount.
+	usedWithV := ListUsedDrives(checker, "V:")
+	if len(usedWithV) != 2 || usedWithV[0] != "D:" || usedWithV[1] != "E:" {
+		t.Fatalf("ListUsedDrives(V:) = %v, want [D: E:]", usedWithV)
+	}
+	// When unmounted (activeMountDrive == ""), V: is reported as used by another drive.
+	usedNone := ListUsedDrives(checker, "")
+	if len(usedNone) != 3 || usedNone[0] != "D:" || usedNone[1] != "E:" || usedNone[2] != "V:" {
+		t.Fatalf("ListUsedDrives('') = %v, want [D: E: V:]", usedNone)
+	}
 }

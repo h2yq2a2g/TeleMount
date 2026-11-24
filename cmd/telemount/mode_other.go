@@ -26,6 +26,10 @@ func runShellAction(_, _, _ string) {
 	log.Fatal("--shell-action is only supported on Windows desktop")
 }
 
+func platformEarlyExit(_ bool) bool {
+	return false
+}
+
 func runPlatform(
 	_ context.Context,
 	appCancel context.CancelFunc,

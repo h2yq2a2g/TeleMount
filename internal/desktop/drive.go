@@ -82,3 +82,23 @@ func ListAvailableDrives(checker DriveChecker, currentDrive string) []string {
 	}
 	return out
 }
+
+// ListUsedDrives returns drive letters in D:-Z: that are currently occupied by another volume
+// on Windows, excluding activeMountDrive (when TeleMount itself is mounted on that letter).
+func ListUsedDrives(checker DriveChecker, activeMountDrive string) []string {
+	if checker == nil {
+		return nil
+	}
+	own, _ := NormalizeDriveLetter(activeMountDrive)
+	var used []string
+	for ch := byte('D'); ch <= 'Z'; ch++ {
+		drv := string(ch) + ":"
+		if drv == own {
+			continue
+		}
+		if inUse, err := checker.IsDriveInUse(drv); err == nil && inUse {
+			used = append(used, drv)
+		}
+	}
+	return used
+}

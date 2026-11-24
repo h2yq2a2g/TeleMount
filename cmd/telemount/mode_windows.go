@@ -102,6 +102,31 @@ func defaultRuntimePaths() (dataDir, tmpDir, listenAddr string) {
 	return root, filepath.Join(root, "tmp"), desktop.DefaultWebAddr
 }
 
+func platformEarlyExit(headless bool) bool {
+	if headless {
+		return false
+	}
+	exePath, _ := os.Executable()
+	// Release Windows builds require installation via TeleMount-Setup.exe (no portable mode).
+	if version.Version != "dev" && exePath != "" {
+		if _, err := os.Stat(filepath.Join(filepath.Dir(exePath), "unins000.exe")); err != nil {
+			_ = tray.NewDialogNotifier().ShowWarningDialog(
+				"TeleMount — Yêu cầu cài đặt",
+				"TeleMount không hỗ trợ chạy bản portable.\nVui lòng cài đặt bằng TeleMount-Setup.exe để dùng đầy đủ WinFsp, menu chuột phải và tự động cập nhật.",
+			)
+			return true
+		}
+	}
+	// WinFsp drives mounted by an elevated (Admin) process are invisible to standard File Explorer.
+	// Automatically drop elevation back to Explorer's non-elevated user token before opening DB/locks.
+	if relaunched, derr := desktop.RelaunchNonElevatedIfNeeded(exePath, os.Args[1:]); derr != nil {
+		log.Printf("de-elevate warning: %v", derr)
+	} else if relaunched {
+		return true
+	}
+	return false
+}
+
 func runPlatform(
 	appCtx context.Context,
 	appCancel context.CancelFunc,
@@ -119,16 +144,6 @@ func runPlatform(
 	}
 
 	exePath, _ := os.Executable()
-	// Release Windows builds require installation via TeleMount-Setup.exe (no portable mode).
-	if version.Version != "dev" && exePath != "" {
-		if _, err := os.Stat(filepath.Join(filepath.Dir(exePath), "unins000.exe")); err != nil {
-			_ = tray.NewDialogNotifier().ShowWarningDialog(
-				"TeleMount — Yêu cầu cài đặt",
-				"TeleMount không hỗ trợ chạy bản portable.\nVui lòng cài đặt bằng TeleMount-Setup.exe để dùng đầy đủ WinFsp, menu chuột phải và tự động cập nhật.",
-			)
-			return
-		}
-	}
 
 	cfgStore, err := desktop.LoadConfig("", dataDir)
 	if err != nil {
@@ -379,8 +394,10 @@ func (r *desktopRuntime) Status() web.DesktopStatus {
 	wf := r.probe.Check()
 	mounted, activeDrive, mountErr := r.mountMgr.Status()
 	drive := cfg.DriveLetter
+	mountedDrive := ""
 	if mounted && activeDrive != "" {
 		drive = activeDrive
+		mountedDrive = activeDrive
 	}
 	cs := r.cache.Stats()
 	qs := r.cache.QueueStatus()
@@ -408,7 +425,8 @@ func (r *desktopRuntime) Status() web.DesktopStatus {
 		WinFspInstalled:      wf.Installed,
 		WinFspGuidance:       wf.Guidance,
 		DriveLetter:          drive,
-		AvailableDrives:      desktop.ListAvailableDrives(r.driveChecker, drive),
+		AvailableDrives:      desktop.ListAvailableDrives(r.driveChecker, mountedDrive),
+		UsedDrives:           desktop.ListUsedDrives(r.driveChecker, mountedDrive),
 		Mounted:              mounted,
 		MountError:           mountErr,
 		RunAtStartup:         runAtStartup,

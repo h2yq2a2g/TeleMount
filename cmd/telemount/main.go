@@ -38,6 +38,10 @@ func main() {
 		return
 	}
 
+	if platformEarlyExit(*headless) {
+		return
+	}
+
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		log.Fatalf("create data dir %s: %v", dataDir, err)
 	}

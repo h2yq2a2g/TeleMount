@@ -9,10 +9,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// LaunchElevatedInstaller launches TeleMount-Setup.exe silently with UAC elevation
-// so Inno Setup can close the running app, replace Program Files\TeleMount, and relaunch minimized.
+// LaunchElevatedInstaller launches TeleMount-Setup.exe silently using the "open" verb
+// so Inno Setup's asInvoker stub starts non-elevated, self-elevates via UAC, and preserves
+// the original non-elevated user token for runasoriginaluser relaunch (required so WinFsp
+// mounts the virtual drive in the user's visible File Explorer session).
 func LaunchElevatedInstaller(installerPath string) error {
-	verb, err := windows.UTF16PtrFromString("runas")
+	verb, err := windows.UTF16PtrFromString("open")
 	if err != nil {
 		return err
 	}

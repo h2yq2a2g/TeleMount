@@ -566,3 +566,18 @@ func TestDesktopShellActionIPCTokenAuth(t *testing.T) {
 		t.Fatalf("unexpected shell action dispatch: (%q, %q)", ctrl.lastAction, ctrl.lastPath)
 	}
 }
+
+func TestStaticAssetsDisableBrowserCache(t *testing.T) {
+	_, _, _, ts := newTestWebServer(t)
+	for _, p := range []string{"/", "/app.js", "/style.css"} {
+		resp, err := http.Get(ts.URL + p)
+		if err != nil {
+			t.Fatalf("GET %s: %v", p, err)
+		}
+		resp.Body.Close()
+		cc := resp.Header.Get("Cache-Control")
+		if !strings.Contains(cc, "no-store") {
+			t.Fatalf("GET %s Cache-Control = %q, want no-store", p, cc)
+		}
+	}
+}

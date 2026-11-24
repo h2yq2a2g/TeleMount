@@ -16,6 +16,7 @@ type DesktopStatus struct {
 	WinFspGuidance       string   `json:"winfsp_guidance"`
 	DriveLetter          string   `json:"drive_letter"`
 	AvailableDrives      []string `json:"available_drives,omitempty"`
+	UsedDrives           []string `json:"used_drives,omitempty"`
 	Mounted              bool     `json:"mounted"`
 	MountError           string   `json:"mount_error"`
 	RunAtStartup         bool     `json:"run_at_startup"`

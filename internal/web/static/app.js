@@ -1231,26 +1231,81 @@ function normalizePinnedPathsInput(text) {
   return out;
 }
 
-function populateDriveSelect(d) {
-  const sel = $('set-desktop-drive');
-  const cur = (d.drive_letter || 'V:').toUpperCase();
-  let drives = Array.isArray(d.available_drives) && d.available_drives.length > 0
-    ? [...d.available_drives]
-    : Array.from({ length: 23 }, (_, i) => String.fromCharCode(68 + i) + ':');
-  if (!drives.includes(cur)) drives.unshift(cur);
+let lastDriveListSig = '';
+let lastDriveProbeAt = 0;
 
+function populateDriveSelect(d, force) {
+  const sel = $('set-desktop-drive');
+  if (!sel) return;
+  const cur = (d.drive_letter || 'V:').toUpperCase();
+  const mounted = Boolean(d.mounted);
+  const avail = Array.isArray(d.available_drives) ? d.available_drives.map((x) => x.toUpperCase()) : [];
+  const used = new Set(Array.isArray(d.used_drives) ? d.used_drives.map((x) => x.toUpperCase()) : []);
+  const allDrives = Array.from({ length: 23 }, (_, i) => String.fromCharCode(68 + i) + ':'); // D:..Z:
+  if (!allDrives.includes(cur)) allDrives.unshift(cur);
+
+  // If backend returned available_drives without used_drives, infer occupied letters.
+  if (used.size === 0 && avail.length > 0) {
+    const availSet = new Set(avail);
+    for (const drv of allDrives) {
+      if (!availSet.has(drv) && !(mounted && drv === cur)) {
+        used.add(drv);
+      }
+    }
+  }
+
+  const sig = `${cur}|${mounted}|${[...used].sort().join(',')}`;
+  if (!force && sig === lastDriveListSig && sel.options.length > 0) {
+    return;
+  }
+  const prevPicked = sel.value;
+  lastDriveListSig = sig;
   sel.innerHTML = '';
-  for (const drv of drives) {
+
+  let firstFree = '';
+  for (const drv of allDrives) {
     const opt = document.createElement('option');
     opt.value = drv;
-    opt.textContent = drv === cur && d.mounted ? `${drv} (đang gắn)` : drv;
+    const isOwnMount = mounted && drv === cur;
+    const isUsed = !isOwnMount && used.has(drv);
+    if (isOwnMount) {
+      opt.textContent = `${drv} — Đang gắn (TeleMount)`;
+    } else if (isUsed) {
+      opt.textContent = drv === cur ? `${drv} — Đang bị ổ khác chiếm (hãy chọn ổ khác)` : `${drv} — Đã được sử dụng`;
+      opt.disabled = true;
+    } else {
+      opt.textContent = `${drv} — Trống`;
+      if (!firstFree) firstFree = drv;
+    }
     sel.appendChild(opt);
   }
-  sel.value = cur;
+
+  const desired = !force && prevPicked && !used.has(prevPicked) ? prevPicked : cur;
+  if (!used.has(desired) || (mounted && desired === cur)) {
+    sel.value = desired;
+  } else if (firstFree) {
+    sel.value = firstFree;
+  } else {
+    sel.value = cur;
+  }
 }
 
+async function refreshDriveDropdownLive() {
+  if (!state.desktopEnabled) return;
+  const now = Date.now();
+  if (now - lastDriveProbeAt < 1500) return;
+  lastDriveProbeAt = now;
+  try {
+    const d = await api('/api/desktop/status');
+    populateDriveSelect(d, false);
+  } catch (_) {}
+}
+
+$('set-desktop-drive').addEventListener('mouseenter', refreshDriveDropdownLive);
+$('set-desktop-drive').addEventListener('focus', refreshDriveDropdownLive);
+
 function populateDesktopSettingsForm(d) {
-  populateDriveSelect(d);
+  populateDriveSelect(d, true);
   renderDesktopUpdateUI(d);
   const c = bytesToCacheInput(d.disk_cache_max_bytes || 10 * 1024 * 1024 * 1024);
   $('set-desktop-cache-val').value = c.val;

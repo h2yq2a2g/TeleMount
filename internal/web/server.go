@@ -121,10 +121,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/accounts/backup/{id}/promote", s.requireAdmin(s.handlePromoteBackupAccount))
 	s.mux.HandleFunc("DELETE /api/accounts/backup/{id}", s.requireAdmin(s.handleDeleteBackupAccount))
 
-	// Embedded Web UI static files
+	// Embedded Web UI static files (disable browser caching so upgrades immediately show updated UI)
 	sub, _ := fs.Sub(staticFS, "static")
 	fileServer := http.FileServer(http.FS(sub))
-	s.mux.Handle("/", fileServer)
+	s.mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		fileServer.ServeHTTP(w, r)
+	}))
 }
 
 func (s *Server) isAuthenticated(r *http.Request) (string, bool) {

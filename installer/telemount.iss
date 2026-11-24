@@ -82,13 +82,21 @@ end;
 
 procedure RestartExplorerAsUser;
 var
-  ResultCode: Integer;
+  ResultCode, Waited: Integer;
 begin
   // Explorer loads ShellIconOverlayIdentifiers only at startup; restart once as the non-elevated user.
   ExecAsOriginalUser(ExpandConstant('{sys}\taskkill.exe'), '/f /im explorer.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(1000);
+  Sleep(800);
   if FindWindowByClassName('Shell_TrayWnd') = 0 then
     ExecAsOriginalUser(ExpandConstant('{win}\explorer.exe'), '', '', SW_SHOWNORMAL, ewNoWait, ResultCode);
+  // Wait for Explorer's taskbar/shell window to come back before [Run] launches telemount.exe.
+  Waited := 0;
+  while (FindWindowByClassName('Shell_TrayWnd') = 0) and (Waited < 10000) do
+  begin
+    Sleep(250);
+    Waited := Waited + 250;
+  end;
+  Sleep(500);
 end;
 
 function NeedsWinFsp: Boolean;
