@@ -60,7 +60,7 @@ func writeDesktopIPCFile(dataDir string, info desktopIPCInfo) {
 func runShellAction(dataDir, action, rawPath string) {
 	raw, err := os.ReadFile(desktopIPCFilePath(dataDir))
 	if err != nil {
-		log.Fatalf("TeleMount chưa chạy hoặc không đọc được IPC: %v", err)
+		log.Fatalf("TeleMount is not running or IPC unavailable: %v", err)
 	}
 	var ipc desktopIPCInfo
 	if err := json.Unmarshal(raw, &ipc); err != nil || ipc.URL == "" || ipc.Token == "" {
@@ -111,8 +111,8 @@ func platformEarlyExit(headless bool) bool {
 	if version.Version != "dev" && exePath != "" {
 		if _, err := os.Stat(filepath.Join(filepath.Dir(exePath), "unins000.exe")); err != nil {
 			_ = tray.NewDialogNotifier().ShowWarningDialog(
-				"TeleMount — Yêu cầu cài đặt",
-				"TeleMount không hỗ trợ chạy bản portable.\nVui lòng cài đặt bằng TeleMount-Setup.exe để dùng đầy đủ WinFsp, menu chuột phải và tự động cập nhật.",
+				"TeleMount — Installation Required",
+				"TeleMount does not support portable execution.\nPlease install using TeleMount-Setup.exe for WinFsp, Explorer integration, and auto-updates.",
 			)
 			return true
 		}
@@ -214,6 +214,7 @@ func runPlatform(
 		exePath:      exePath,
 		webURL:       webURL,
 		ipcToken:     ipcToken,
+		st:           st,
 		cfgStore:     cfgStore,
 		cache:        cache,
 		mountMgr:     mountMgr,
@@ -329,6 +330,7 @@ type desktopRuntime struct {
 	exePath      string
 	webURL       string
 	ipcToken     string
+	st           *state.Manager
 	cfgStore     *desktop.ConfigStore
 	cache        *diskcache.Manager
 	mountMgr     *vfs.MountManager
@@ -351,6 +353,25 @@ type desktopRuntime struct {
 	promptedVer    string
 }
 
+func (r *desktopRuntime) lang() string {
+	if r.st != nil {
+		return r.st.Language()
+	}
+	return "en"
+}
+
+func (r *desktopRuntime) tr(en, vi string) string {
+	if r.lang() == "vi" {
+		return vi
+	}
+	return en
+}
+
+func (r *desktopRuntime) OnLanguageChange(_ string) {
+	r.syncShellIntegration(r.cfgStore.Get().DriveLetter)
+	r.refreshTray()
+}
+
 func (r *desktopRuntime) syncShellIntegration(driveLetter string) {
 	writeDesktopIPCFile(r.dataDir, desktopIPCInfo{
 		URL:   r.webURL,
@@ -358,7 +379,7 @@ func (r *desktopRuntime) syncShellIntegration(driveLetter string) {
 		Drive: driveLetter,
 	})
 	if r.exePath != "" {
-		if err := desktop.RegisterShellMenu(r.exePath, driveLetter); err != nil {
+		if err := desktop.RegisterShellMenu(r.exePath, driveLetter, r.lang()); err != nil {
 			log.Printf("register explorer shell menu warning: %v", err)
 		}
 	}
@@ -547,23 +568,35 @@ func (r *desktopRuntime) HandleShellAction(ctx context.Context, action, rawPath 
 		if !desktop.IsPathPinned(pins, vpath) {
 			pins = append(pins, vpath)
 			if _, err := r.UpdateSettings(web.DesktopSettingsUpdate{PinnedPaths: &pins}); err != nil {
-				r.notifyTray("TeleMount — Lỗi ghim offline", err.Error(), true)
+				r.notifyTray(r.tr("TeleMount — Pin failed", "TeleMount — Lỗi ghim offline"), err.Error(), true)
 				return web.ShellActionResult{}, err
 			}
 		}
 		if r.engine.IsReady() {
-			r.notifyTray("TeleMount — Giữ offline", fmt.Sprintf("Đang tải lưu offline: %s", vpath), false)
+			r.notifyTray(
+				r.tr("TeleMount — Always keep on device", "TeleMount — Giữ offline"),
+				fmt.Sprintf(r.tr("Downloading for offline access: %s", "Đang tải lưu offline: %s"), vpath),
+				false,
+			)
 			go func() {
 				if err := r.cache.PinSync(context.Background(), vpath); err != nil {
-					r.notifyTray("TeleMount — Lỗi tải offline", fmt.Sprintf("%s: %v", vpath, err), true)
+					r.notifyTray(r.tr("TeleMount — Offline download failed", "TeleMount — Lỗi tải offline"), fmt.Sprintf("%s: %v", vpath, err), true)
 					return
 				}
 				ps, _ := r.cache.PathStatus(vpath)
-				r.notifyTray("TeleMount — Đã giữ trên máy", fmt.Sprintf("%s (%d tệp · %s)", vpath, ps.CachedFiles, fmtHumanBytes(ps.CachedBytes)), false)
+				r.notifyTray(
+					r.tr("TeleMount — Kept on this device", "TeleMount — Đã giữ trên máy"),
+					fmt.Sprintf(r.tr("%s (%d files · %s)", "%s (%d tệp · %s)"), vpath, ps.CachedFiles, fmtHumanBytes(ps.CachedBytes)),
+					false,
+				)
 				r.refreshTray()
 			}()
 		} else {
-			r.notifyTray("TeleMount — Đã ghim offline", fmt.Sprintf("%s (sẽ tự tải khi Telegram online)", vpath), false)
+			r.notifyTray(
+				r.tr("TeleMount — Pinned for offline", "TeleMount — Đã ghim offline"),
+				fmt.Sprintf(r.tr("%s (will download when Telegram is online)", "%s (sẽ tự tải khi Telegram online)"), vpath),
+				false,
+			)
 		}
 		return web.ShellActionResult{OK: true, Message: "pinned " + vpath}, nil
 
@@ -584,40 +617,55 @@ func (r *desktopRuntime) HandleShellAction(ctx context.Context, action, rawPath 
 			return nil
 		})
 		if err != nil {
-			r.notifyTray("TeleMount — Lỗi giải phóng", err.Error(), true)
+			r.notifyTray(r.tr("TeleMount — Free up space failed", "TeleMount — Lỗi giải phóng"), err.Error(), true)
 			return web.ShellActionResult{}, err
 		}
 		_ = r.cache.SetPinnedPaths(updated.PinnedPaths)
 
 		if desktop.IsPathPinned(updated.PinnedPaths, vpath) {
-			msg := fmt.Sprintf("Thư mục cha của %s đang được ghim offline — hãy chọn Giải phóng dung lượng trên thư mục cha.", vpath)
-			r.notifyTray("TeleMount — Đang bị ghim từ thư mục cha", msg, true)
+			msg := fmt.Sprintf(
+				r.tr("A parent folder of %s is pinned offline — run Free up space on the parent folder.", "Thư mục cha của %s đang được ghim offline — hãy chọn Giải phóng dung lượng trên thư mục cha."),
+				vpath,
+			)
+			r.notifyTray(r.tr("TeleMount — Pinned via parent folder", "TeleMount — Đang bị ghim từ thư mục cha"), msg, true)
 			return web.ShellActionResult{OK: false, Message: msg}, nil
 		}
 
 		freed, evicted, skippedDirty, err := r.cache.EvictPath(vpath)
 		if err != nil {
-			r.notifyTray("TeleMount — Lỗi giải phóng", err.Error(), true)
+			r.notifyTray(r.tr("TeleMount — Free up space failed", "TeleMount — Lỗi giải phóng"), err.Error(), true)
 			return web.ShellActionResult{}, err
 		}
 		var msg string
 		switch {
 		case evicted > 0 && skippedDirty > 0:
-			msg = fmt.Sprintf("Đã giải phóng %s (%d tệp) khỏi máy, vẫn giữ trên Cloud. Giữ lại %d tệp chưa đồng bộ.", fmtHumanBytes(freed), evicted, skippedDirty)
+			msg = fmt.Sprintf(
+				r.tr("Freed %s (%d files) locally; kept on Cloud. Preserved %d unsynced files.", "Đã giải phóng %s (%d tệp) khỏi máy, vẫn giữ trên Cloud. Giữ lại %d tệp chưa đồng bộ."),
+				fmtHumanBytes(freed), evicted, skippedDirty,
+			)
 		case evicted > 0:
-			msg = fmt.Sprintf("Đã giải phóng %s (%d tệp) khỏi máy — dữ liệu vẫn giữ an toàn trên Telegram Cloud.", fmtHumanBytes(freed), evicted)
+			msg = fmt.Sprintf(
+				r.tr("Freed %s (%d files) from this device — safely kept on Telegram Cloud.", "Đã giải phóng %s (%d tệp) khỏi máy — dữ liệu vẫn giữ an toàn trên Telegram Cloud."),
+				fmtHumanBytes(freed), evicted,
+			)
 		case skippedDirty > 0:
-			msg = fmt.Sprintf("Chưa thể giải phóng %s vì còn %d tệp chưa đồng bộ lên Telegram.", vpath, skippedDirty)
+			msg = fmt.Sprintf(
+				r.tr("Cannot free %s while %d files are pending upload to Telegram.", "Chưa thể giải phóng %s vì còn %d tệp chưa đồng bộ lên Telegram."),
+				vpath, skippedDirty,
+			)
 		default:
-			msg = fmt.Sprintf("%s hiện chỉ nằm trên Cloud (0 B trên máy).", vpath)
+			msg = fmt.Sprintf(
+				r.tr("%s is already cloud-only (0 B on this device).", "%s hiện chỉ nằm trên Cloud (0 B trên máy)."),
+				vpath,
+			)
 		}
-		r.notifyTray("TeleMount — Giải phóng dung lượng", msg, skippedDirty > 0 && evicted == 0)
+		r.notifyTray(r.tr("TeleMount — Free up space", "TeleMount — Giải phóng dung lượng"), msg, skippedDirty > 0 && evicted == 0)
 		r.refreshTray()
 		return web.ShellActionResult{OK: true, Message: msg}, nil
 
 	case "sync":
 		if err := r.FlushQueue(ctx); err != nil {
-			r.notifyTray("TeleMount — Lỗi đồng bộ", err.Error(), true)
+			r.notifyTray(r.tr("TeleMount — Sync failed", "TeleMount — Lỗi đồng bộ"), err.Error(), true)
 			return web.ShellActionResult{}, err
 		}
 		if r.engine.IsReady() && desktop.IsPathPinned(r.cfgStore.Get().PinnedPaths, vpath) {
@@ -626,27 +674,8 @@ func (r *desktopRuntime) HandleShellAction(ctx context.Context, action, rawPath 
 				r.refreshTray()
 			}()
 		}
-		msg := fmt.Sprintf("Đã đồng bộ xong: %s", vpath)
-		r.notifyTray("TeleMount — Đồng bộ ngay", msg, false)
-		return web.ShellActionResult{OK: true, Message: msg}, nil
-
-	case "status":
-		ps, err := r.cache.PathStatus(vpath)
-		if err != nil {
-			r.notifyTray("TeleMount — Lỗi kiểm tra", err.Error(), true)
-			return web.ShellActionResult{}, err
-		}
-		stateLabel := "Chỉ trên Cloud (tự tải khi mở)"
-		if ps.Pinned {
-			stateLabel = "Luôn giữ offline trên máy"
-		} else if ps.CachedFiles > 0 {
-			stateLabel = "Đang lưu đệm trên máy (cache)"
-		}
-		msg := fmt.Sprintf("%s\n%s · Trên máy: %s (%d tệp)", vpath, stateLabel, fmtHumanBytes(ps.CachedBytes), ps.CachedFiles)
-		if ps.DirtyFiles > 0 {
-			msg += fmt.Sprintf(" · Chờ upload: %d", ps.DirtyFiles)
-		}
-		r.notifyTray("TeleMount — Trạng thái", msg, false)
+		msg := fmt.Sprintf(r.tr("Synced: %s", "Đã đồng bộ xong: %s"), vpath)
+		r.notifyTray(r.tr("TeleMount — Sync now", "TeleMount — Đồng bộ ngay"), msg, false)
 		return web.ShellActionResult{OK: true, Message: msg}, nil
 
 	default:
@@ -688,7 +717,7 @@ func (r *desktopRuntime) Unmount() error {
 func (r *desktopRuntime) OpenDrive() error {
 	mounted, drv, _ := r.mountMgr.Status()
 	if !mounted {
-		return errors.New("ổ đĩa ảo chưa được mount")
+		return errors.New(r.tr("virtual drive is not mounted", "ổ đĩa ảo chưa được mount"))
 	}
 	return tray.OpenDrivePath(drv)
 }
@@ -721,6 +750,7 @@ func (r *desktopRuntime) TrayStatus() tray.TrayStatus {
 		Online:          r.engine.IsReady(),
 		UpdateAvailable: st.UpdateAvailable,
 		LatestVersion:   st.LatestVersion,
+		Language:        r.lang(),
 	}
 }
 
@@ -772,12 +802,20 @@ func (r *desktopRuntime) autoCheckOnce(ctx context.Context) {
 	r.refreshTray()
 
 	if r.cfgStore.Get().AutoUpdate {
-		r.notifyTray("TeleMount — Tự động cập nhật", fmt.Sprintf("Đang cập nhật lên phiên bản %s...", info.LatestVersion), false)
+		r.notifyTray(
+			r.tr("TeleMount — Auto-Update", "TeleMount — Tự động cập nhật"),
+			fmt.Sprintf(r.tr("Updating to version %s...", "Đang cập nhật lên phiên bản %s..."), info.LatestVersion),
+			false,
+		)
 		if err := r.ApplyUpdate(ctx); err != nil && !errors.Is(err, desktop.ErrUpdateCanceled) {
-			r.notifyTray("TeleMount — Lỗi cập nhật", err.Error(), true)
+			r.notifyTray(r.tr("TeleMount — Update failed", "TeleMount — Lỗi cập nhật"), err.Error(), true)
 		}
 	} else {
-		r.notifyTray("TeleMount — Có bản cập nhật mới", fmt.Sprintf("Phiên bản %s đã sẵn sàng (đang dùng %s).", info.LatestVersion, version.Version), false)
+		r.notifyTray(
+			r.tr("TeleMount — Update available", "TeleMount — Có bản cập nhật mới"),
+			fmt.Sprintf(r.tr("Version %s is ready (current: %s).", "Phiên bản %s đã sẵn sàng (đang dùng %s)."), info.LatestVersion, version.Version),
+			false,
+		)
 	}
 }
 
@@ -801,7 +839,7 @@ func (r *desktopRuntime) ApplyUpdate(ctx context.Context) error {
 	r.updateMu.Lock()
 	if r.updating {
 		r.updateMu.Unlock()
-		return errors.New("đang tiến hành cập nhật")
+		return errors.New(r.tr("an update is already in progress", "đang tiến hành cập nhật"))
 	}
 	info := r.updateInfo
 	r.updating = true
@@ -827,7 +865,7 @@ func (r *desktopRuntime) ApplyUpdate(ctx context.Context) error {
 		info = fresh
 	}
 	if !info.Available {
-		return fmt.Errorf("đang ở phiên bản mới nhất (%s)", version.Version)
+		return fmt.Errorf(r.tr("already on the latest version (%s)", "đang ở phiên bản mới nhất (%s)"), version.Version)
 	}
 
 	dlCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -882,10 +920,14 @@ func (r *desktopRuntime) TriggerUpdate() error {
 		return err
 	}
 	if !st.UpdateAvailable {
-		r.notifyTray("TeleMount", fmt.Sprintf("Đang ở phiên bản mới nhất (%s).", version.Version), false)
+		r.notifyTray("TeleMount", fmt.Sprintf(r.tr("Already on the latest version (%s).", "Đang ở phiên bản mới nhất (%s)."), version.Version), false)
 		return nil
 	}
-	r.notifyTray("TeleMount — Cập nhật", fmt.Sprintf("Đang tải và xác thực bản %s...", st.LatestVersion), false)
+	r.notifyTray(
+		r.tr("TeleMount — Updating", "TeleMount — Cập nhật"),
+		fmt.Sprintf(r.tr("Downloading and verifying %s...", "Đang tải và xác thực bản %s..."), st.LatestVersion),
+		false,
+	)
 	err = r.ApplyUpdate(context.Background())
 	if errors.Is(err, desktop.ErrUpdateCanceled) {
 		return nil

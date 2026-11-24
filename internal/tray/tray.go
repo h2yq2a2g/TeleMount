@@ -40,6 +40,7 @@ type TrayStatus struct {
 	Online          bool   `json:"online"`
 	UpdateAvailable bool   `json:"update_available"`
 	LatestVersion   string `json:"latest_version"`
+	Language        string `json:"language,omitempty"`
 }
 
 // TrayUpdater is an optional extension of TrayActions for checking/applying updates from the tray menu.
@@ -101,16 +102,33 @@ func displayDrive(drive string) string {
 	return strings.ToUpper(strings.TrimRight(d, `\/`))
 }
 
+func isVI(lang string) bool {
+	return strings.EqualFold(strings.TrimSpace(lang), "vi")
+}
+
 func BuildMenuItems(status TrayStatus) []MenuItem {
 	drive := displayDrive(status.DriveLetter)
+	vi := isVI(status.Language)
 
 	var stateParts []string
 	if !status.WinFspInstalled {
-		stateParts = append(stateParts, "WinFsp Missing")
+		if vi {
+			stateParts = append(stateParts, "Thiếu WinFsp")
+		} else {
+			stateParts = append(stateParts, "WinFsp Missing")
+		}
 	} else if status.Mounted {
-		stateParts = append(stateParts, "Mounted")
+		if vi {
+			stateParts = append(stateParts, "Đã gắn")
+		} else {
+			stateParts = append(stateParts, "Mounted")
+		}
 	} else {
-		stateParts = append(stateParts, "Unmounted")
+		if vi {
+			stateParts = append(stateParts, "Chưa gắn")
+		} else {
+			stateParts = append(stateParts, "Unmounted")
+		}
 	}
 	if status.Online {
 		stateParts = append(stateParts, "Online")
@@ -118,19 +136,44 @@ func BuildMenuItems(status TrayStatus) []MenuItem {
 		stateParts = append(stateParts, "Offline")
 	}
 	if status.QueuePending > 0 {
-		stateParts = append(stateParts, fmt.Sprintf("%d queued", status.QueuePending))
+		if vi {
+			stateParts = append(stateParts, fmt.Sprintf("%d chờ đồng bộ", status.QueuePending))
+		} else {
+			stateParts = append(stateParts, fmt.Sprintf("%d queued", status.QueuePending))
+		}
 	}
 
 	mountLabel := fmt.Sprintf("Mount Drive (%s)", drive)
+	if vi {
+		mountLabel = fmt.Sprintf("Gắn ổ đĩa (%s)", drive)
+	}
 	mountEnabled := status.WinFspInstalled
 	if status.Mounted {
 		mountLabel = fmt.Sprintf("Unmount Drive (%s)", drive)
+		if vi {
+			mountLabel = fmt.Sprintf("Ngắt ổ đĩa (%s)", drive)
+		}
 		mountEnabled = true
 	}
 
+	openDriveLabel := fmt.Sprintf("Open Virtual Drive (%s)", drive)
+	openWebLabel := "Open Web UI"
+	startupLabel := "Run at Windows Startup"
 	updateLabel := "Check for Updates..."
+	quitLabel := "Quit TeleMount"
+	if vi {
+		openDriveLabel = fmt.Sprintf("Mở ổ đĩa ảo (%s)", drive)
+		openWebLabel = "Mở bảng điều khiển Web UI"
+		startupLabel = "Tự khởi động cùng Windows"
+		updateLabel = "Kiểm tra cập nhật..."
+		quitLabel = "Thoát TeleMount"
+	}
 	if status.UpdateAvailable && status.LatestVersion != "" {
-		updateLabel = fmt.Sprintf("Update to %s...", status.LatestVersion)
+		if vi {
+			updateLabel = fmt.Sprintf("Cập nhật lên %s...", status.LatestVersion)
+		} else {
+			updateLabel = fmt.Sprintf("Update to %s...", status.LatestVersion)
+		}
 	}
 
 	return []MenuItem{
@@ -147,18 +190,18 @@ func BuildMenuItems(status TrayStatus) []MenuItem {
 		},
 		{
 			ID:      MenuIDOpenDrive,
-			Label:   fmt.Sprintf("Open Virtual Drive (%s)", drive),
+			Label:   openDriveLabel,
 			Enabled: status.Mounted,
 		},
 		{
 			ID:      MenuIDOpenWebUI,
-			Label:   "Open Web UI",
+			Label:   openWebLabel,
 			Enabled: true,
 		},
 		{Separator: true},
 		{
 			ID:      MenuIDToggleStartup,
-			Label:   "Run at Windows Startup",
+			Label:   startupLabel,
 			Enabled: true,
 			Checked: status.RunAtStartup,
 		},
@@ -170,7 +213,7 @@ func BuildMenuItems(status TrayStatus) []MenuItem {
 		{Separator: true},
 		{
 			ID:      MenuIDQuit,
-			Label:   "Quit TeleMount",
+			Label:   quitLabel,
 			Enabled: true,
 		},
 	}
@@ -178,14 +221,27 @@ func BuildMenuItems(status TrayStatus) []MenuItem {
 
 func FormatTooltip(status TrayStatus) string {
 	drive := displayDrive(status.DriveLetter)
+	vi := isVI(status.Language)
 	var msg string
 	switch {
 	case !status.WinFspInstalled:
-		msg = "TeleMount — WinFsp missing (see guidance)"
+		if vi {
+			msg = "TeleMount — Thiếu WinFsp"
+		} else {
+			msg = "TeleMount — WinFsp missing (see guidance)"
+		}
 	case status.Mounted:
-		msg = fmt.Sprintf("TeleMount (%s) — Mounted", drive)
+		if vi {
+			msg = fmt.Sprintf("TeleMount (%s) — Đã gắn", drive)
+		} else {
+			msg = fmt.Sprintf("TeleMount (%s) — Mounted", drive)
+		}
 	default:
-		msg = fmt.Sprintf("TeleMount (%s) — Unmounted", drive)
+		if vi {
+			msg = fmt.Sprintf("TeleMount (%s) — Chưa gắn", drive)
+		} else {
+			msg = fmt.Sprintf("TeleMount (%s) — Unmounted", drive)
+		}
 	}
 	if status.Online {
 		msg += ", Online"
@@ -193,7 +249,11 @@ func FormatTooltip(status TrayStatus) string {
 		msg += ", Offline"
 	}
 	if status.QueuePending > 0 {
-		msg += fmt.Sprintf(", %d pending", status.QueuePending)
+		if vi {
+			msg += fmt.Sprintf(", %d chờ đồng bộ", status.QueuePending)
+		} else {
+			msg += fmt.Sprintf(", %d pending", status.QueuePending)
+		}
 	}
 	return truncateUTF16Units(msg, 127)
 }

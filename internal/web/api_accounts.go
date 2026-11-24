@@ -88,7 +88,7 @@ func (s *Server) handleStartBackupAccount(w http.ResponseWriter, r *http.Request
 		apiHash = snap.TGAPIHash
 	}
 	if apiID <= 0 || apiHash == "" {
-		writeErr(w, http.StatusBadRequest, "Chưa có Telegram API ID / API Hash trên hệ thống")
+		writeErr(w, http.StatusBadRequest, "Telegram API ID / API Hash not configured")
 		return
 	}
 
@@ -284,7 +284,7 @@ func (s *Server) handlePromoteBackupAccount(w http.ResponseWriter, r *http.Reque
 	snap := s.engine.State().Snapshot()
 	s.tgMgr.SetChannel(promoted.OwnChannelID, promoted.OwnChannelAccessHash)
 	if err := s.tgMgr.Start(context.Background(), snap.TGAPIID, snap.TGAPIHash); err != nil {
-		writeErr(w, http.StatusBadGateway, "Đã chuyển DB sang nick mới nhưng kết nối lại gặp lỗi: "+err.Error())
+		writeErr(w, http.StatusBadGateway, "Promoted backup account but reconnect failed: "+err.Error())
 		return
 	}
 

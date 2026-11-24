@@ -294,3 +294,25 @@ func TestNewAppNilActions(t *testing.T) {
 		t.Fatalf("expected ErrNilActions, got %v", err)
 	}
 }
+
+func TestBuildMenuItemsVietnameseLocalization(t *testing.T) {
+	items := BuildMenuItems(TrayStatus{
+		WinFspInstalled: true,
+		Mounted:         true,
+		DriveLetter:     "G:",
+		Online:          true,
+		Language:        "vi",
+	})
+	var foundUnmount, foundQuit bool
+	for _, it := range items {
+		if it.ID == MenuIDMountToggle && strings.Contains(it.Label, "Ngắt ổ đĩa (G:)") {
+			foundUnmount = true
+		}
+		if it.ID == MenuIDQuit && it.Label == "Thoát TeleMount" {
+			foundQuit = true
+		}
+	}
+	if !foundUnmount || !foundQuit {
+		t.Fatalf("Vietnamese tray labels missing: %+v", items)
+	}
+}

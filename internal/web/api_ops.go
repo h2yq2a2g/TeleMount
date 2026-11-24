@@ -89,7 +89,7 @@ func (s *Server) handleChangeAdminPassword(w http.ResponseWriter, r *http.Reques
 	}
 	snap := s.engine.State().Snapshot()
 	if !s.engine.State().VerifyAdmin(snap.AdminUser, req.CurrentPassword) {
-		writeErr(w, http.StatusUnauthorized, "Mật khẩu hiện tại không đúng")
+		writeErr(w, http.StatusUnauthorized, "Current password is incorrect")
 		return
 	}
 	newUser := strings.TrimSpace(req.NewUsername)
@@ -175,7 +175,7 @@ func (s *Server) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.engine.RestoreDBFromTelegram(r.Context(), req.MsgID, req.Passphrase); err != nil {
 		if errors.Is(err, crypto.ErrDecryptFailed) {
-			writeErr(w, http.StatusBadRequest, "Sai Encryption Key hoặc bản backup bị lỗi xác thực")
+			writeErr(w, http.StatusBadRequest, "Invalid encryption key or corrupted backup")
 			return
 		}
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -228,7 +228,7 @@ type = webdav
 url = %s
 vendor = other
 user = %s
-pass = <chạy: rclone obscure "MAT_KHAU_WEBDAV">
+pass = <run: rclone obscure "WEBDAV_PASSWORD">
 `, dockerURL, user)
 
 	mountCmd := `rclone mount telemount: /mnt/telemount \

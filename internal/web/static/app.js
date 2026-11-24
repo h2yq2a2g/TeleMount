@@ -9,6 +9,8 @@ const state = {
   orphanIds: [],
   rcloneConf: '',
   desktopEnabled: false,
+  canPersistLang: false,
+  lastDesktopStatus: null,
 };
 
 function applyDesktopVisibility() {
@@ -31,13 +33,45 @@ function applyDesktopVisibility() {
     if (el) el.classList.toggle('hidden', isDesktop);
   });
   if ($('dash-title')) {
-    $('dash-title').textContent = isDesktop ? 'Tổng quan & Vận hành' : 'Tổng quan & Vận hành WebDAV';
+    $('dash-title').textContent = isDesktop ? t('dashTitleDesktop') : t('dashTitleServer');
   }
   if (!isDesktop) {
     if ($('desktop-winfsp-banner')) $('desktop-winfsp-banner').classList.add('hidden');
     if ($('desktop-update-banner')) $('desktop-update-banner').classList.add('hidden');
   }
 }
+
+async function setLanguage(lang, persist = true) {
+  const norm = normalizeLang(lang);
+  applyI18n(norm);
+  applyDesktopVisibility();
+
+  if (persist && state.canPersistLang) {
+    try {
+      await api('/api/language', { method: 'PUT', body: JSON.stringify({ language: norm }) });
+    } catch (_) {}
+  }
+
+  // Re-render dynamic views immediately in the new language.
+  if (!$('view-app').classList.contains('hidden')) {
+    if (state.activePage === 'dashboard') {
+      loadDashboard();
+      if (!state.desktopEnabled) loadRcloneSnippet();
+    } else if (state.activePage === 'settings') {
+      loadSettings();
+      loadAccounts();
+      if (state.desktopEnabled && state.lastDesktopStatus) {
+        populateDesktopSettingsForm(state.lastDesktopStatus);
+      } else if (state.desktopEnabled) {
+        loadDesktopSettings();
+      }
+    }
+  }
+}
+
+document.querySelectorAll('.lang-btn[data-lang]').forEach((btn) => {
+  btn.addEventListener('click', () => setLanguage(btn.dataset.lang, true));
+});
 
 // --- Helpers ---
 function toast(msg, type = 'ok') {
@@ -76,7 +110,8 @@ function fmtBytes(b) {
 
 function fmtTime(unix) {
   if (!unix) return '—';
-  return new Date(unix * 1000).toLocaleString('vi-VN');
+  const locale = getLang() === 'vi' ? 'vi-VN' : 'en-US';
+  return new Date(unix * 1000).toLocaleString(locale);
 }
 
 function esc(s) {
@@ -91,9 +126,14 @@ function showView(viewId) {
 
 // --- Bootstrap ---
 async function boot() {
+  applyI18n();
   try {
     const st = await api('/api/status');
     state.desktopEnabled = Boolean(st.desktop_enabled);
+    state.canPersistLang = Boolean(!st.has_admin || st.authenticated);
+    if (st.language) {
+      applyI18n(st.language);
+    }
     applyDesktopVisibility();
     if (!st.has_admin) {
       showView('view-setup');
@@ -179,10 +219,11 @@ $('form-setup-admin').addEventListener('submit', async (e) => {
   const u = $('setup-admin-user').value.trim();
   const p1 = $('setup-admin-pass').value;
   const p2 = $('setup-admin-pass2').value;
-  if (p1 !== p2) return toast('Mật khẩu nhập lại không khớp', 'err');
+  if (p1 !== p2) return toast(t('passMismatch'), 'err');
   try {
     await api('/api/setup/admin', { method: 'POST', body: JSON.stringify({ username: u, password: p1 }) });
-    toast('Đã tạo tài khoản Admin Web UI');
+    state.canPersistLang = true;
+    toast(t('adminCreated'));
     await syncWizard();
   } catch (err) { toast(err.message, 'err'); }
 });
@@ -200,7 +241,7 @@ $('form-tg-api').addEventListener('submit', async (e) => {
         api_hash: $('tg-api-hash').value.trim(),
       }),
     });
-    toast('Đã kết nối MTProto tới Telegram');
+    toast(t('mtprotoConnected'));
     if (res.authorized) {
       await syncWizard();
     } else {
@@ -213,10 +254,10 @@ $('form-tg-api').addEventListener('submit', async (e) => {
 
 document.querySelectorAll('[data-auth-tab]').forEach((btn) => {
   btn.addEventListener('click', () => {
-    const t = btn.dataset.authTab;
+    const tab = btn.dataset.authTab;
     document.querySelectorAll('[data-auth-tab]').forEach((b) => b.classList.toggle('active', b === btn));
-    $('auth-pane-qr').classList.toggle('hidden', t !== 'qr');
-    $('auth-pane-phone').classList.toggle('hidden', t !== 'phone');
+    $('auth-pane-qr').classList.toggle('hidden', tab !== 'qr');
+    $('auth-pane-phone').classList.toggle('hidden', tab !== 'phone');
   });
 });
 
@@ -226,7 +267,7 @@ function stopQRPoll() {
 
 async function startQRLogin() {
   stopQRPoll();
-  $('qr-holder').innerHTML = '<span class="muted">Đang tạo mã QR...</span>';
+  $('qr-holder').innerHTML = `<span class="muted">${esc(t('qrGenerating'))}</span>`;
   try {
     const st = await api('/api/setup/telegram/qr/start', { method: 'POST' });
     renderQR(st);
@@ -235,7 +276,7 @@ async function startQRLogin() {
         const res = await api('/api/setup/telegram/qr/status');
         if (res.authorized || res.qr.status === 'authorized') {
           stopQRPoll();
-          toast('Đăng nhập Telegram thành công!');
+          toast(t('tgLoginOk'));
           await syncWizard();
           return;
         }
@@ -256,7 +297,7 @@ function renderQR(qr) {
   }
   if (qr.status === 'error') {
     stopQRPoll();
-    $('qr-holder').innerHTML = `<span class="muted">${esc(qr.error || 'Lỗi QR')}</span>`;
+    $('qr-holder').innerHTML = `<span class="muted">${esc(qr.error || t('qrError'))}</span>`;
     return;
   }
   if (qr.qr_data_url) {
@@ -269,7 +310,7 @@ $('btn-qr-start').addEventListener('click', startQRLogin);
 $('btn-send-otp').addEventListener('click', async () => {
   try {
     await api('/api/setup/telegram/phone/code', { method: 'POST', body: JSON.stringify({ phone: $('tg-phone').value }) });
-    toast('Đã gửi mã OTP tới Telegram của anh');
+    toast(t('otpSent'));
   } catch (err) { toast(err.message, 'err'); }
 });
 
@@ -278,10 +319,10 @@ $('btn-verify-otp').addEventListener('click', async () => {
     const res = await api('/api/setup/telegram/phone/verify', { method: 'POST', body: JSON.stringify({ code: $('tg-otp').value }) });
     if (res.need_password) {
       $('auth-pane-2fa').classList.remove('hidden');
-      toast('Vui lòng nhập mật khẩu 2FA Telegram');
+      toast(t('twoFaPrompt'));
       return;
     }
-    toast('Đăng nhập Telegram thành công!');
+    toast(t('tgLoginOk'));
     await syncWizard();
   } catch (err) { toast(err.message, 'err'); }
 });
@@ -289,18 +330,18 @@ $('btn-verify-otp').addEventListener('click', async () => {
 $('btn-verify-2fa').addEventListener('click', async () => {
   try {
     await api('/api/setup/telegram/password', { method: 'POST', body: JSON.stringify({ password: $('tg-2fa').value }) });
-    toast('Xác thực 2FA thành công!');
+    toast(t('twoFaOk'));
     await syncWizard();
   } catch (err) { toast(err.message, 'err'); }
 });
 
 // Channel selection
 async function loadChannels() {
-  $('channel-list').innerHTML = '<div class="muted">Đang tải danh sách Private Channel...</div>';
+  $('channel-list').innerHTML = `<div class="muted">${esc(t('loadingChannels'))}</div>`;
   try {
     const res = await api('/api/setup/channels');
     if (!res.channels || res.channels.length === 0) {
-      $('channel-list').innerHTML = '<div class="muted">Chưa có Private Channel nào. Hãy tạo mới ở ô trên.</div>';
+      $('channel-list').innerHTML = `<div class="muted">${esc(t('noChannels'))}</div>`;
       return;
     }
     $('channel-list').innerHTML = '';
@@ -310,11 +351,11 @@ async function loadChannels() {
       row.innerHTML = `<div><strong>${esc(ch.title)}</strong> <span class="muted small">(#${ch.id})</span></div>`;
       const btn = document.createElement('button');
       btn.className = 'btn btn-secondary small-btn';
-      btn.textContent = 'Chọn';
+      btn.textContent = t('choose');
       btn.onclick = async () => {
         try {
           await api('/api/setup/channels/select', { method: 'POST', body: JSON.stringify(ch) });
-          toast(`Đã chọn channel "${ch.title}"`);
+          toast(t('channelSelected', { title: ch.title }));
           await syncWizard();
         } catch (err) { toast(err.message, 'err'); }
       };
@@ -331,7 +372,7 @@ $('btn-create-channel').addEventListener('click', async () => {
   const title = $('new-channel-title').value.trim() || 'TeleMount Storage';
   try {
     const res = await api('/api/setup/channels/create', { method: 'POST', body: JSON.stringify({ title }) });
-    toast(`Đã tạo channel "${res.channel.title}"`);
+    toast(t('channelCreated', { title: res.channel.title }));
     await syncWizard();
   } catch (err) { toast(err.message, 'err'); }
 });
@@ -339,11 +380,11 @@ $('btn-create-channel').addEventListener('click', async () => {
 // Key Setup / Restore
 document.querySelectorAll('[data-key-tab]').forEach((btn) => {
   btn.addEventListener('click', () => {
-    const t = btn.dataset.keyTab;
+    const tab = btn.dataset.keyTab;
     document.querySelectorAll('[data-key-tab]').forEach((b) => b.classList.toggle('active', b === btn));
-    $('key-pane-fresh').classList.toggle('hidden', t !== 'fresh');
-    $('key-pane-restore').classList.toggle('hidden', t !== 'restore');
-    if (t === 'restore' && ($('restore-backup-select').options.length === 0 || $('restore-backup-select').value === '0')) {
+    $('key-pane-fresh').classList.toggle('hidden', tab !== 'fresh');
+    $('key-pane-restore').classList.toggle('hidden', tab !== 'restore');
+    if (tab === 'restore' && ($('restore-backup-select').options.length === 0 || $('restore-backup-select').value === '0')) {
       probeChannelBackupsForWizard();
     }
   });
@@ -351,14 +392,14 @@ document.querySelectorAll('[data-key-tab]').forEach((btn) => {
 
 async function probeChannelBackupsForWizard() {
   const sel = $('restore-backup-select');
-  sel.innerHTML = '<option value="0">Đang quét bản backup trên Channel...</option>';
+  sel.innerHTML = `<option value="0">${esc(t('scanningBackups'))}</option>`;
   $('existing-backup-notice').classList.add('hidden');
   try {
     const res = await api('/api/ops/backups');
     const list = res.backups || [];
     sel.innerHTML = '';
     if (list.length > 0) {
-      $('existing-backup-notice').textContent = `Phát hiện ${list.length} bản backup trên Channel này! Anh có thể sang tab "Khôi phục từ Channel cũ" và nhập Encryption Key cũ.`;
+      $('existing-backup-notice').textContent = t('foundBackupsNotice', { count: list.length });
       $('existing-backup-notice').classList.remove('hidden');
       list.forEach((b) => {
         const opt = document.createElement('option');
@@ -369,14 +410,14 @@ async function probeChannelBackupsForWizard() {
     } else {
       const opt = document.createElement('option');
       opt.value = '0';
-      opt.textContent = '(Chưa tìm thấy bản backup .tmdb / .tddb nào trong Channel)';
+      opt.textContent = t('noBackupsInChannel');
       sel.appendChild(opt);
     }
   } catch (err) {
     sel.innerHTML = '';
     const opt = document.createElement('option');
     opt.value = '0';
-    opt.textContent = `(Lỗi tải danh sách backup: ${err.message})`;
+    opt.textContent = t('backupLoadErr', { msg: err.message });
     sel.appendChild(opt);
     toast(err.message, 'err');
   }
@@ -399,14 +440,14 @@ $('btn-gen-key').addEventListener('click', async () => {
 
 $('btn-copy-key').addEventListener('click', () => {
   const v = $('fresh-key-input').value;
-  if (!v) return toast('Chưa có key để copy', 'err');
+  if (!v) return toast(t('noKeyCopy'), 'err');
   navigator.clipboard.writeText(v);
-  toast('Đã copy Encryption Key vào clipboard');
+  toast(t('keyCopied'));
 });
 
 $('btn-dl-key').addEventListener('click', () => {
   const v = $('fresh-key-input').value;
-  if (!v) return toast('Chưa có key để tải', 'err');
+  if (!v) return toast(t('noKeyDownload'), 'err');
   const blob = new Blob([`TeleMount Encryption Key\nCreated: ${new Date().toISOString()}\nKey: ${v}\n`], { type: 'text/plain' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -416,13 +457,13 @@ $('btn-dl-key').addEventListener('click', () => {
 
 $('btn-init-key').addEventListener('click', async () => {
   const passphrase = $('fresh-key-input').value;
-  if (passphrase.length < 4) return toast('Encryption Key cần ít nhất 4 ký tự', 'err');
-  if (!$('chk-saved-key').checked) return toast('Vui lòng tick xác nhận anh đã cất giữ Encryption Key', 'err');
+  if (passphrase.length < 4) return toast(t('keyTooShort'), 'err');
+  if (!$('chk-saved-key').checked) return toast(t('mustConfirmKey'), 'err');
   const btn = $('btn-init-key');
   btn.disabled = true;
   try {
     await api('/api/setup/key/init', { method: 'POST', body: JSON.stringify({ passphrase }) });
-    toast('Đã băm & khởi tạo Encryption Key thành công!');
+    toast(t('keyInitialized'));
     await syncWizard();
   } catch (err) { toast(err.message, 'err'); }
   finally { btn.disabled = false; }
@@ -431,12 +472,12 @@ $('btn-init-key').addEventListener('click', async () => {
 $('btn-restore-key').addEventListener('click', async () => {
   const passphrase = $('restore-key-input').value;
   const msg_id = Number($('restore-backup-select').value || 0);
-  if (!passphrase) return toast('Vui lòng nhập Encryption Key cũ', 'err');
+  if (!passphrase) return toast(t('enterOldKeyErr'), 'err');
   const btn = $('btn-restore-key');
   btn.disabled = true;
   try {
     const res = await api('/api/setup/key/restore', { method: 'POST', body: JSON.stringify({ passphrase, msg_id }) });
-    toast(`Khôi phục thành công! (${res.stats ? res.stats.file_count : 0} tệp)`);
+    toast(t('restoreOk', { count: res.stats ? res.stats.file_count : 0 }));
     await syncWizard();
   } catch (err) { toast(err.message, 'err'); }
   finally { btn.disabled = false; }
@@ -456,7 +497,7 @@ $('form-setup-webdav').addEventListener('submit', async (e) => {
       method: 'POST',
       body: JSON.stringify({ username: $('setup-dav-user').value.trim(), password: $('setup-dav-pass').value }),
     });
-    toast('Hoàn tất thiết lập TeleMount!');
+    toast(t('setupComplete'));
     await boot();
   } catch (err) { toast(err.message, 'err'); }
 });
@@ -495,7 +536,7 @@ function stopDashPoll() {
 async function loadDashboard() {
   try {
     const d = await api('/api/dashboard');
-    $('sidebar-channel').textContent = d.channel?.title || 'Chưa chọn channel';
+    $('sidebar-channel').textContent = d.channel?.title || t('noChannelSelected');
     const pill = $('tg-status-pill');
     if (d.telegram?.authorized && d.telegram?.connected) {
       const uname = d.telegram.user?.username ? `@${d.telegram.user.username}` : (d.telegram.user?.first_name || 'Connected');
@@ -508,16 +549,22 @@ async function loadDashboard() {
 
     if (d.stats) {
       $('kpi-size').textContent = fmtBytes(d.stats.total_plain_size);
-      $('kpi-parts').textContent = `Mã hóa: ${fmtBytes(d.stats.total_cipher_size)} (${d.stats.part_count} parts)`;
-      $('kpi-files').textContent = `${d.stats.file_count} tệp`;
-      $('kpi-folders').textContent = `${d.stats.folder_count} thư mục`;
+      $('kpi-parts').textContent = t('kpiEncryptedParts', { bytes: fmtBytes(d.stats.total_cipher_size), count: d.stats.part_count });
+      $('kpi-files').textContent = t('kpiFiles', { count: d.stats.file_count });
+      $('kpi-folders').textContent = t('kpiFolders', { count: d.stats.folder_count });
 
       const pk = d.stats.packs || {};
       const stg = d.packer || {};
-      $('pack-summary-line').textContent =
-        `Đang gom trên RAM: ${stg.buffered_files || 0} tệp (${fmtBytes(stg.buffered_bytes || 0)})` +
-        (stg.inflight_packs ? ` · Đang đẩy: ${stg.inflight_packs} pack` : '') +
-        `  |  Trên Telegram: ${pk.pack_count || 0} packs (Sống: ${fmtBytes(pk.live_pack_bytes || 0)} / Tổng: ${fmtBytes(pk.total_pack_bytes || 0)} · Rác chờ compact: ${fmtBytes(pk.dead_pack_bytes || 0)})`;
+      const inflight = stg.inflight_packs ? t('packInflight', { n: stg.inflight_packs }) : '';
+      $('pack-summary-line').textContent = t('packSummaryLine', {
+        bufFiles: stg.buffered_files || 0,
+        bufBytes: fmtBytes(stg.buffered_bytes || 0),
+        inflight,
+        packs: pk.pack_count || 0,
+        live: fmtBytes(pk.live_pack_bytes || 0),
+        total: fmtBytes(pk.total_pack_bytes || 0),
+        dead: fmtBytes(pk.dead_pack_bytes || 0),
+      });
     }
     if (d.cache) {
       const usedMB = (d.cache.used_bytes / 1048576).toFixed(1);
@@ -525,21 +572,21 @@ async function loadDashboard() {
       const total = (d.cache.hits || 0) + (d.cache.misses || 0);
       const rate = total > 0 ? Math.round((d.cache.hits / total) * 100) : 0;
       $('kpi-cache').textContent = `${usedMB} / ${maxMB} MB`;
-      $('kpi-cache-hit').textContent = `Hit: ${rate}% (${d.cache.entries} chunks)`;
+      $('kpi-cache-hit').textContent = t('kpiHitChunks', { rate, count: d.cache.entries });
     }
-    $('kpi-tg').textContent = d.telegram?.authorized ? 'Online' : 'Offline';
-    $('kpi-mem').textContent = `Go RAM: ${fmtBytes(d.mem_alloc_bytes)} · Uptime ${Math.floor((d.uptime_sec || 0) / 60)}m`;
+    $('kpi-tg').textContent = d.telegram?.authorized ? t('online') : t('offline');
+    $('kpi-mem').textContent = t('goRamUptime', { ram: fmtBytes(d.mem_alloc_bytes), mins: Math.floor((d.uptime_sec || 0) / 60) });
 
     const trBox = $('active-transfers');
     const trs = d.telegram?.active_transfers || [];
     if (!trs.length) {
-      trBox.innerHTML = 'Không có luồng nào đang chạy.';
+      trBox.textContent = t('noActiveTransfers');
     } else {
-      trBox.innerHTML = trs.map((t) => {
-        const pct = t.total > 0 ? Math.min(100, Math.round((t.done / t.total) * 100)) : 0;
+      trBox.innerHTML = trs.map((tr) => {
+        const pct = tr.total > 0 ? Math.min(100, Math.round((tr.done / tr.total) * 100)) : 0;
         return `<div class="list-item">
           <div style="flex:1">
-            <div>${t.kind === 'upload' ? '⬆' : '⬇'} <strong>${esc(t.name)}</strong> (${fmtBytes(t.done)} / ${t.total > 0 ? fmtBytes(t.total) : '?'} · ${fmtBytes(t.speed_bps)}/s)</div>
+            <div>${tr.kind === 'upload' ? '⬆' : '⬇'} <strong>${esc(tr.name)}</strong> (${fmtBytes(tr.done)} / ${tr.total > 0 ? fmtBytes(tr.total) : '?'} · ${fmtBytes(tr.speed_bps)}/s)</div>
             <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
           </div>
         </div>`;
@@ -549,10 +596,10 @@ async function loadDashboard() {
     const flBox = $('flood-events');
     const fls = d.telegram?.recent_floods || [];
     if (!fls.length) {
-      flBox.innerHTML = 'Chưa ghi nhận FloodWait.';
+      flBox.textContent = t('noFloodEvents');
     } else {
       flBox.innerHTML = fls.slice(0, 8).map((f) =>
-        `<div class="list-item"><span><code>${esc(f.method)}</code> — chờ <strong>${f.duration_sec}s</strong></span><span class="muted small">${fmtTime(f.at)}</span></div>`
+        `<div class="list-item"><span><code>${esc(f.method)}</code> — <strong>${esc(t('floodWaitItem', { sec: f.duration_sec }))}</strong></span><span class="muted small">${fmtTime(f.at)}</span></div>`
       ).join('');
     }
     if (state.desktopEnabled) {
@@ -567,7 +614,7 @@ async function loadDashboard() {
 
 $('btn-refresh-dash').addEventListener('click', loadDashboard);
 $('btn-clear-cache').addEventListener('click', async () => {
-  try { await api('/api/ops/cache/clear', { method: 'POST' }); toast('Đã giải phóng RAM cache'); loadDashboard(); }
+  try { await api('/api/ops/cache/clear', { method: 'POST' }); toast(t('toastRamCleared')); loadDashboard(); }
   catch (err) { toast(err.message, 'err'); }
 });
 $('btn-flush-pack').addEventListener('click', async () => {
@@ -575,7 +622,7 @@ $('btn-flush-pack').addEventListener('click', async () => {
   btn.disabled = true;
   try {
     await api('/api/ops/packs/flush', { method: 'POST' });
-    toast('Đã đẩy toàn bộ RAM Pack lên Telegram!');
+    toast(t('toastPackFlushed'));
     loadDashboard();
   } catch (err) { toast(err.message, 'err'); }
   finally { btn.disabled = false; }
@@ -586,9 +633,9 @@ $('btn-compact-packs').addEventListener('click', async () => {
   try {
     const r = await api('/api/ops/packs/compact', { method: 'POST' });
     if (!r.compacted_packs) {
-      toast('Các Pack hiện đã tối ưu, chưa cần compact thêm');
+      toast(t('toastPacksOptimal'));
     } else {
-      toast(`Đã compact ${r.compacted_packs} pack -> ${r.created_packs} pack mới, thu hồi ${fmtBytes(r.reclaimed_bytes)}!`);
+      toast(t('toastPacksCompacted', { old: r.compacted_packs, new: r.created_packs, bytes: fmtBytes(r.reclaimed_bytes) }));
     }
     loadDashboard();
   } catch (err) { toast(err.message, 'err'); }
@@ -599,8 +646,8 @@ async function loadRcloneSnippet() {
   try {
     const r = await api('/api/ops/rclone-config');
     state.rcloneConf = r.rclone_conf;
-    $('rclone-int-url').textContent = r.internal_url;
-    $('rclone-ext-url').textContent = r.external_url;
+    if ($('rclone-int-url')) $('rclone-int-url').textContent = r.internal_url;
+    if ($('rclone-ext-url')) $('rclone-ext-url').textContent = r.external_url;
     $('rclone-conf-box').textContent = r.rclone_conf;
     $('rclone-mount-box').textContent = r.mount_cmd;
   } catch (_) {}
@@ -608,34 +655,34 @@ async function loadRcloneSnippet() {
 
 $('btn-copy-rclone').addEventListener('click', () => {
   navigator.clipboard.writeText(state.rcloneConf || '');
-  toast('Đã copy snippet rclone.conf');
+  toast(t('rcloneCopied'));
 });
 
 $('btn-scan-orphans').addEventListener('click', async () => {
-  $('orphan-result').textContent = 'Đang quét lịch sử Telegram Channel...';
+  $('orphan-result').textContent = t('scanningHistory');
   try {
     const r = await api('/api/ops/orphans');
     state.orphanIds = (r.orphans || []).map((o) => o.msg_id);
     $('btn-clean-orphans').classList.toggle('hidden', state.orphanIds.length === 0);
     if (!state.orphanIds.length) {
-      $('orphan-result').textContent = `Đã quét ${r.scanned_docs} document trên Channel — không có blob thừa nào!`;
+      $('orphan-result').textContent = t('noOrphansFound', { docs: r.scanned_docs });
     } else {
-      $('orphan-result').textContent = `Đã quét ${r.scanned_docs} document — phát hiện ${state.orphanIds.length} blob thừa (${fmtBytes(r.total_bytes)}).`;
+      $('orphan-result').textContent = t('orphansFound', { docs: r.scanned_docs, count: state.orphanIds.length, bytes: fmtBytes(r.total_bytes) });
     }
   } catch (err) {
-    $('orphan-result').textContent = `Lỗi: ${err.message}`;
+    $('orphan-result').textContent = t('errorPrefix', { msg: err.message });
   }
 });
 
 $('btn-clean-orphans').addEventListener('click', async () => {
   if (!state.orphanIds.length) return;
-  if (!confirm(`Xóa ${state.orphanIds.length} blob thừa khỏi Telegram Channel?`)) return;
+  if (!confirm(t('confirmCleanOrphans', { count: state.orphanIds.length }))) return;
   try {
     const r = await api('/api/ops/orphans/clean', { method: 'POST', body: JSON.stringify({ msg_ids: state.orphanIds }) });
-    toast(`Đã dọn ${r.deleted} blob thừa trên Telegram`);
+    toast(t('orphansCleaned', { count: r.deleted }));
     state.orphanIds = [];
     $('btn-clean-orphans').classList.add('hidden');
-    $('orphan-result').textContent = 'Đã dọn sạch.';
+    $('orphan-result').textContent = t('cleanedDone');
   } catch (err) { toast(err.message, 'err'); }
 });
 
@@ -652,8 +699,8 @@ async function loadSettings() {
     $('set-backup-min').value = s.backup_interval_min;
     $('set-dav-user').value = s.webdav_user || '';
     $('last-backup-info').textContent = s.last_backup_at
-      ? `Lần backup gần nhất: ${fmtTime(s.last_backup_at)} (msg #${s.last_backup_msg_id})`
-      : 'Chưa có bản backup nào.';
+      ? t('lastBackupLine', { time: fmtTime(s.last_backup_at), id: s.last_backup_msg_id })
+      : t('noBackupYet');
   } catch (err) { toast(err.message, 'err'); }
 }
 
@@ -672,7 +719,7 @@ $('form-settings').addEventListener('submit', async (e) => {
         backup_interval_min: Number($('set-backup-min').value),
       }),
     });
-    toast('Đã lưu cài đặt Hybrid Pack & RAM cache');
+    toast(t('toastSettingsSaved'));
   } catch (err) { toast(err.message, 'err'); }
 });
 
@@ -684,7 +731,7 @@ $('form-set-webdav').addEventListener('submit', async (e) => {
       body: JSON.stringify({ username: $('set-dav-user').value.trim(), password: $('set-dav-pass').value }),
     });
     $('set-dav-pass').value = '';
-    toast('Đã cập nhật tài khoản WebDAV');
+    toast(t('toastWebdavUpdated'));
   } catch (err) { toast(err.message, 'err'); }
 });
 
@@ -701,7 +748,7 @@ $('form-set-admin-pass').addEventListener('submit', async (e) => {
     });
     $('cur-admin-pass').value = '';
     $('new-admin-pass').value = '';
-    toast('Đã đổi mật khẩu Admin Web UI');
+    toast(t('toastAdminPassChanged'));
   } catch (err) { toast(err.message, 'err'); }
 });
 
@@ -710,7 +757,7 @@ $('btn-backup-now').addEventListener('click', async () => {
   btn.disabled = true;
   try {
     const r = await api('/api/ops/backup', { method: 'POST' });
-    toast(`Đã backup DB mã hóa lên Telegram (msg #${r.msg_id}, ${fmtBytes(r.size)})`);
+    toast(t('toastBackupDone', { id: r.msg_id, bytes: fmtBytes(r.size) }));
     loadSettings();
     loadBackupsInSettings();
   } catch (err) { toast(err.message, 'err'); }
@@ -720,13 +767,13 @@ $('btn-backup-now').addEventListener('click', async () => {
 async function loadBackupsInSettings() {
   const box = $('backup-list');
   const sel = $('settings-restore-select');
-  box.innerHTML = '<div class="muted small">Đang tải...</div>';
+  box.innerHTML = `<div class="muted small">${esc(t('loading'))}</div>`;
   sel.innerHTML = '';
   try {
     const r = await api('/api/ops/backups');
     const list = r.backups || [];
     if (!list.length) {
-      box.innerHTML = '<div class="muted small">Chưa có bản backup nào trên Channel.</div>';
+      box.innerHTML = `<div class="muted small">${esc(t('noBackupsOnChannel'))}</div>`;
       return;
     }
     box.innerHTML = list.map((b) =>
@@ -747,19 +794,19 @@ $('btn-load-backups').addEventListener('click', loadBackupsInSettings);
 $('btn-settings-restore').addEventListener('click', async () => {
   const msg_id = Number($('settings-restore-select').value || 0);
   const passphrase = $('settings-restore-key').value;
-  if (!passphrase) return toast('Nhập Encryption Key để xác nhận khôi phục', 'err');
-  if (!confirm('Khôi phục DB sẽ ghi đè cây thư mục hiện tại bằng bản backup đã chọn. Tiếp tục?')) return;
+  if (!passphrase) return toast(t('enterKeyToRestore'), 'err');
+  if (!confirm(t('confirmRestoreDb'))) return;
   try {
     await api('/api/ops/restore', { method: 'POST', body: JSON.stringify({ msg_id, passphrase }) });
     $('settings-restore-key').value = '';
-    toast('Khôi phục DB thành công!');
+    toast(t('toastDbRestored'));
     loadSettings();
   } catch (err) { toast(err.message, 'err'); }
 });
 
 // --- Multi-Account Telegram Backup Mirroring ---
 function fmtTGUser(u) {
-  if (!u) return 'Chưa rõ';
+  if (!u) return t('unknownUser');
   const name = [u.first_name, u.last_name].filter(Boolean).join(' ') || 'User';
   return u.username ? `${name} (@${u.username})` : (u.phone ? `${name} (+${u.phone})` : name);
 }
@@ -771,30 +818,44 @@ async function loadAccounts() {
     const p = res.primary || {};
     const backups = res.backups || [];
 
+    const primaryMeta = t('primaryChannelMeta', {
+      title: p.channel_title || '—',
+      id: p.channel_id || 0,
+      status: p.authorized ? t('online') : t('offline'),
+      total: p.total_blobs || 0,
+    });
+
     let html = `
       <div class="list-item" style="border-color:rgba(34,197,94,0.45)">
         <div>
-          <strong>⭐ Nick Chính: ${esc(fmtTGUser(p.user))}</strong>
-          <div class="muted small">Channel chính: <strong>${esc(p.channel_title || '—')}</strong> (#${p.channel_id || 0}) · Trạng thái: ${p.authorized ? 'Online' : 'Offline'} · Tổng gốc: ${p.total_blobs || 0} blobs</div>
+          <strong>⭐ ${esc(t('primaryAccLabel'))} ${esc(fmtTGUser(p.user))}</strong>
+          <div class="muted small">${esc(primaryMeta)}</div>
         </div>
-        <span class="status-pill ${p.authorized ? 'ok' : 'err'}">${p.authorized ? '● Đang làm chính' : '● Mất kết nối'}</span>
+        <span class="status-pill ${p.authorized ? 'ok' : 'err'}">${esc(p.authorized ? t('badgePrimaryActive') : t('badgeDisconnected'))}</span>
       </div>
     `;
 
     if (!backups.length) {
-      html += `<div class="muted small">Chưa có tài khoản Backup nào. Bấm <strong>+ Thêm nick Backup</strong> để nhân bản dữ liệu dự phòng.</div>`;
+      html += `<div class="muted small">${t('noBackupAccountsHtml')}</div>`;
     } else {
       backups.forEach((b) => {
         const pct = b.total_blobs > 0 ? Math.min(100, Math.round((b.synced_blobs / b.total_blobs) * 100)) : 100;
+        const backupMeta = t('backupChannelMeta', {
+          title: b.own_channel_title || t('notCreatedYet'),
+          synced: b.synced_blobs,
+          total: b.total_blobs,
+          pct,
+          status: b.authorized ? t('online') : b.connection_state,
+        });
         html += `
           <div class="list-item">
             <div style="flex:1">
-              <strong>🛡️ Backup: ${esc(fmtTGUser(b.user))} <span class="muted small">(${esc(b.id)})</span></strong>
-              <div class="muted small">Channel riêng: <strong>${esc(b.own_channel_title || 'Chưa tạo')}</strong> · Đã mirror: <strong>${b.synced_blobs}/${b.total_blobs}</strong> blobs (${pct}%) · ${b.authorized ? 'Online' : b.connection_state}</div>
+              <strong>🛡️ ${esc(t('backupAccLabel'))} ${esc(fmtTGUser(b.user))} <span class="muted small">(${esc(b.id)})</span></strong>
+              <div class="muted small">${esc(backupMeta)}</div>
             </div>
             <div class="row-inline">
-              <button type="button" class="btn btn-secondary small-btn" data-promote="${esc(b.id)}">Đặt làm Nick Chính</button>
-              <button type="button" class="btn btn-danger small-btn" data-del-acc="${esc(b.id)}">Gỡ</button>
+              <button type="button" class="btn btn-secondary small-btn" data-promote="${esc(b.id)}">${esc(t('btnPromotePrimary'))}</button>
+              <button type="button" class="btn btn-danger small-btn" data-del-acc="${esc(b.id)}">${esc(t('btnRemove'))}</button>
             </div>
           </div>
         `;
@@ -805,11 +866,11 @@ async function loadAccounts() {
     box.querySelectorAll('[data-promote]').forEach((btn) => {
       btn.onclick = async () => {
         const id = btn.dataset.promote;
-        if (!confirm(`Chuyển tài khoản Backup (${id}) và Channel riêng của nó lên làm Nick Chính? (Dùng khi nick chính bị khóa hoặc muốn đổi nick chính)`)) return;
+        if (!confirm(t('confirmPromote', { id }))) return;
         btn.disabled = true;
         try {
           const r = await api(`/api/accounts/backup/${id}/promote`, { method: 'POST' });
-          toast(`Đã chuyển sang Nick Chính mới (Channel: ${r.new_channel})!`);
+          toast(t('toastPromoted', { title: r.new_channel }));
           loadAccounts();
           loadDashboard();
         } catch (err) { toast(err.message, 'err'); }
@@ -820,10 +881,10 @@ async function loadAccounts() {
     box.querySelectorAll('[data-del-acc]').forEach((btn) => {
       btn.onclick = async () => {
         const id = btn.dataset.delAcc;
-        if (!confirm(`Gỡ tài khoản Backup (${id}) khỏi hệ thống? (Các blob đã copy trên Channel riêng của nick đó vẫn được giữ nguyên trên Telegram)`)) return;
+        if (!confirm(t('confirmRemoveAcc', { id }))) return;
         try {
           await api(`/api/accounts/backup/${id}`, { method: 'DELETE' });
-          toast('Đã gỡ tài khoản Backup');
+          toast(t('toastAccRemoved'));
           loadAccounts();
         } catch (err) { toast(err.message, 'err'); }
       };
@@ -839,9 +900,9 @@ $('btn-sync-accounts').addEventListener('click', async () => {
   try {
     const r = await api('/api/accounts/sync', { method: 'POST', body: JSON.stringify({}) });
     if (r.errors && r.errors.length) {
-      toast(`Đã đồng bộ ${r.synced_blobs} blobs (Lưu ý: ${r.errors.join('; ')})`, 'err');
+      toast(t('toastSyncedWithErr', { count: r.synced_blobs, errs: r.errors.join('; ') }), 'err');
     } else {
-      toast(`Đã đồng bộ xong (${r.synced_blobs} blobs mới được copy sang Backup)!`);
+      toast(t('toastSyncedOk', { count: r.synced_blobs }));
     }
     loadAccounts();
   } catch (err) { toast(err.message, 'err'); }
@@ -861,17 +922,17 @@ $('btn-close-bacc-modal').addEventListener('click', closeBaccModal);
 
 document.querySelectorAll('[data-bacc-tab]').forEach((btn) => {
   btn.addEventListener('click', () => {
-    const t = btn.dataset.baccTab;
+    const tab = btn.dataset.baccTab;
     document.querySelectorAll('[data-bacc-tab]').forEach((b) => b.classList.toggle('active', b === btn));
-    $('bacc-pane-qr').classList.toggle('hidden', t !== 'qr');
-    $('bacc-pane-phone').classList.toggle('hidden', t !== 'phone');
+    $('bacc-pane-qr').classList.toggle('hidden', tab !== 'qr');
+    $('bacc-pane-phone').classList.toggle('hidden', tab !== 'phone');
   });
 });
 
 $('btn-add-backup-acc').addEventListener('click', async () => {
   $('backup-acc-modal').classList.remove('hidden');
   $('bacc-pane-2fa').classList.add('hidden');
-  $('bacc-qr-holder').innerHTML = '<span class="muted">Đang kết nối MTProto...</span>';
+  $('bacc-qr-holder').innerHTML = `<span class="muted">${esc(t('baccConnecting'))}</span>`;
   try {
     const r = await api('/api/accounts/backup/start', { method: 'POST', body: JSON.stringify({}) });
     state.baccPendingId = r.id;
@@ -888,7 +949,7 @@ $('btn-add-backup-acc').addEventListener('click', async () => {
 async function startBaccQR() {
   if (!state.baccPendingId) return;
   stopBaccQR();
-  $('bacc-qr-holder').innerHTML = '<span class="muted">Đang tạo mã QR...</span>';
+  $('bacc-qr-holder').innerHTML = `<span class="muted">${esc(t('qrGenerating'))}</span>`;
   try {
     const qr = await api(`/api/accounts/backup/${state.baccPendingId}/qr/start`, { method: 'POST' });
     renderBaccQR(qr);
@@ -929,7 +990,7 @@ $('btn-bacc-send-otp').addEventListener('click', async () => {
       method: 'POST',
       body: JSON.stringify({ phone: $('bacc-phone').value }),
     });
-    toast('Đã gửi mã OTP tới nick Backup');
+    toast(t('baccOtpSent'));
   } catch (err) { toast(err.message, 'err'); }
 });
 
@@ -942,7 +1003,7 @@ $('btn-bacc-verify-otp').addEventListener('click', async () => {
     });
     if (r.need_password) {
       $('bacc-pane-2fa').classList.remove('hidden');
-      toast('Nhập thêm mật khẩu 2FA của nick Backup');
+      toast(t('baccNeed2fa'));
       return;
     }
     await finalizeBackupLogin();
@@ -962,11 +1023,11 @@ $('btn-bacc-verify-2fa').addEventListener('click', async () => {
 
 async function finalizeBackupLogin() {
   stopBaccQR();
-  $('bacc-qr-holder').innerHTML = '<span class="muted">Đang tạo Channel riêng &amp; liên kết đồng bộ...</span>';
+  $('bacc-qr-holder').innerHTML = `<span class="muted">${esc(t('baccFinalizing'))}</span>`;
   try {
     const r = await api(`/api/accounts/backup/${state.baccPendingId}/finalize`, { method: 'POST' });
     closeBaccModal();
-    toast(`Đã thêm nick Backup & tạo channel "${r.account.own_channel_title}" — đang tự đồng bộ dữ liệu!`);
+    toast(t('baccAddedToast', { title: r.account.own_channel_title }));
     loadAccounts();
     setTimeout(loadAccounts, 3000);
   } catch (err) {
@@ -985,20 +1046,18 @@ async function loadDesktopStatus() {
 
 function renderDesktopStatus(d) {
   if (!d) return;
+  state.lastDesktopStatus = d;
   const winfspOk = Boolean(d.winfsp_installed);
   $('desktop-winfsp-banner').classList.toggle('hidden', winfspOk);
-  $('desktop-winfsp-guidance').textContent =
-    d.winfsp_guidance || 'Cài đặt WinFsp từ winfsp.dev hoặc chạy winget install WinFsp.WinFsp để bật ổ đĩa ảo.';
+  $('desktop-winfsp-guidance').textContent = d.winfsp_guidance || t('winfspDefaultGuidance');
 
   renderDesktopUpdateUI(d);
 
   $('desktop-drive-letter').textContent = d.drive_letter || 'V:';
   const badge = $('desktop-mount-badge');
-  badge.textContent = d.mounted ? '● Đã gắn (Mounted)' : '● Chưa gắn (Unmounted)';
+  badge.textContent = d.mounted ? t('mountedBadge') : t('unmountedBadge');
   badge.className = `status-pill ${d.mounted ? 'ok' : 'err'}`;
-  $('desktop-startup-badge').textContent = d.run_at_startup
-    ? '· Tự khởi động Windows: Bật'
-    : '· Tự khởi động Windows: Tắt';
+  $('desktop-startup-badge').textContent = d.run_at_startup ? t('startupOnBadge') : t('startupOffBadge');
 
   const mErrEl = $('desktop-mount-error');
   mErrEl.textContent = d.mount_error || '';
@@ -1011,16 +1070,16 @@ function renderDesktopStatus(d) {
   const qState = $('desktop-queue-state');
   const qCount = d.queue_pending_count || 0;
   if (d.queue_syncing) {
-    qState.textContent = '● Đang đồng bộ...';
+    qState.textContent = t('queueSyncing');
     qState.className = 'status-pill warn';
   } else if (qCount > 0) {
-    qState.textContent = '● Chờ đồng bộ';
+    qState.textContent = t('queuePending');
     qState.className = 'status-pill warn';
   } else {
-    qState.textContent = '● Đã đồng bộ';
+    qState.textContent = t('queueSynced');
     qState.className = 'status-pill ok';
   }
-  $('desktop-queue-summary').textContent = `Chờ đồng bộ: ${qCount} tác vụ (${fmtBytes(d.queue_pending_bytes || 0)})`;
+  $('desktop-queue-summary').textContent = t('queueSummary', { count: qCount, bytes: fmtBytes(d.queue_pending_bytes || 0) });
   const qErrEl = $('desktop-queue-error');
   qErrEl.textContent = d.queue_last_error || '';
   qErrEl.classList.toggle('hidden', !d.queue_last_error);
@@ -1030,14 +1089,16 @@ function renderDesktopStatus(d) {
   const pct = max > 0 ? Math.min(100, Math.round((used / max) * 100)) : 0;
   $('desktop-disk-cache-usage').textContent = `${fmtBytes(used)} / ${fmtBytes(max)}`;
   $('desktop-disk-cache-bar').style.width = `${pct}%`;
-  $('desktop-disk-cache-meta').textContent =
-    `Đã ghim (Pinned): ${fmtBytes(d.disk_cache_pinned_bytes || 0)} · ${d.disk_cache_entries || 0} mục`;
+  $('desktop-disk-cache-meta').textContent = t('cacheMeta', {
+    bytes: fmtBytes(d.disk_cache_pinned_bytes || 0),
+    count: d.disk_cache_entries || 0,
+  });
 }
 
 $('btn-copy-winget').addEventListener('click', () => {
   const cmd = $('winget-winfsp-cmd').textContent || 'winget install WinFsp.WinFsp';
   if (navigator.clipboard) navigator.clipboard.writeText(cmd);
-  toast('Đã copy lệnh winget cài đặt WinFsp');
+  toast(t('wingetCopied'));
 });
 
 $('btn-desktop-mount').addEventListener('click', async () => {
@@ -1046,7 +1107,7 @@ $('btn-desktop-mount').addEventListener('click', async () => {
   try {
     const r = await api('/api/desktop/mount', { method: 'POST' });
     if (r && r.status) renderDesktopStatus(r.status);
-    toast('Đã gắn ổ đĩa ảo TeleMount!');
+    toast(t('toastMounted'));
   } catch (err) {
     toast(err.message, 'err');
     await loadDesktopStatus();
@@ -1059,7 +1120,7 @@ $('btn-desktop-unmount').addEventListener('click', async () => {
   try {
     const r = await api('/api/desktop/unmount', { method: 'POST' });
     if (r && r.status) renderDesktopStatus(r.status);
-    toast('Đã ngắt ổ đĩa ảo TeleMount');
+    toast(t('toastUnmounted'));
   } catch (err) {
     toast(err.message, 'err');
     await loadDesktopStatus();
@@ -1084,7 +1145,7 @@ $('btn-desktop-flush-queue').addEventListener('click', async () => {
   try {
     const r = await api('/api/desktop/queue/flush', { method: 'POST' });
     if (r && r.status) renderDesktopStatus(r.status);
-    toast('Đã đồng bộ hàng đợi ghi offline!');
+    toast(t('toastQueueFlushed'));
   } catch (err) {
     toast(err.message, 'err');
     await loadDesktopStatus();
@@ -1099,7 +1160,7 @@ $('btn-desktop-clear-cache').addEventListener('click', async () => {
   try {
     const r = await api('/api/desktop/cache/clear', { method: 'POST' });
     if (r && r.status) renderDesktopStatus(r.status);
-    toast('Đã xóa cache đĩa chưa ghim');
+    toast(t('toastDiskCacheCleared'));
   } catch (err) {
     toast(err.message, 'err');
   } finally {
@@ -1117,8 +1178,8 @@ function renderDesktopUpdateUI(d) {
   if (updBanner) {
     updBanner.classList.toggle('hidden', !d.update_available);
     if (d.update_available) {
-      $('desktop-update-title').textContent = `Có phiên bản TeleMount mới: ${d.latest_version}`;
-      $('desktop-update-desc').textContent = `Đang dùng ${d.app_version || 'dev'} · Bản cài sẽ được xác thực SHA-256 trước khi cập nhật.`;
+      $('desktop-update-title').textContent = t('updateBannerTitle', { ver: d.latest_version });
+      $('desktop-update-desc').textContent = t('updateBannerDesc', { cur: d.app_version || 'dev' });
       if (d.release_url) $('desktop-update-link').href = d.release_url;
     }
   }
@@ -1128,7 +1189,7 @@ function renderDesktopUpdateUI(d) {
   const applyEl = $('btn-settings-apply-update');
   if (stEl && linkEl && applyEl) {
     if (d.update_available) {
-      stEl.textContent = `Đã có phiên bản mới ${d.latest_version} (hiện tại: ${d.app_version || 'dev'}). Bấm "Cập nhật ngay" để tải, kiểm tra SHA-256 và tự nâng cấp.`;
+      stEl.textContent = t('updateStatusAvail', { ver: d.latest_version, cur: d.app_version || 'dev' });
       stEl.className = 'alert alert-info';
       if (d.release_url) {
         linkEl.href = d.release_url;
@@ -1136,12 +1197,12 @@ function renderDesktopUpdateUI(d) {
       }
       applyEl.classList.remove('hidden');
     } else if (d.update_error) {
-      stEl.textContent = `Lỗi kiểm tra cập nhật: ${d.update_error}`;
+      stEl.textContent = t('updateStatusErr', { msg: d.update_error });
       stEl.className = 'muted small';
       linkEl.classList.add('hidden');
       applyEl.classList.add('hidden');
     } else if (d.latest_version) {
-      stEl.textContent = `Đang dùng phiên bản mới nhất (${d.app_version || d.latest_version}).`;
+      stEl.textContent = t('updateStatusLatest', { ver: d.app_version || d.latest_version });
       stEl.className = 'muted small';
       linkEl.classList.add('hidden');
       applyEl.classList.add('hidden');
@@ -1160,9 +1221,9 @@ async function runDesktopUpdateCheck(btn) {
     if (r && r.status) {
       renderDesktopStatus(r.status);
       if (r.status.update_available) {
-        toast(`Đã phát hiện phiên bản mới ${r.status.latest_version}!`);
+        toast(t('toastUpdateFound', { ver: r.status.latest_version }));
       } else {
-        toast(`Đang dùng phiên bản mới nhất (${r.status.app_version || 'dev'}).`);
+        toast(t('toastUpToDate', { ver: r.status.app_version || 'dev' }));
       }
     }
   } catch (err) {
@@ -1175,9 +1236,9 @@ async function runDesktopUpdateCheck(btn) {
 async function runDesktopUpdateApply(btn) {
   if (btn) btn.disabled = true;
   try {
-    toast('Đang tải, kiểm tra SHA-256 và khởi chạy bộ cài cập nhật...');
+    toast(t('toastUpdateStarting'));
     await api('/api/desktop/update/apply', { method: 'POST' });
-    toast('Đang cập nhật TeleMount — app sẽ tự khởi động lại trong giây lát!');
+    toast(t('toastUpdateRestarting'));
   } catch (err) {
     toast(err.message, 'err');
     if (btn) btn.disabled = false;
@@ -1208,8 +1269,8 @@ function normalizeDriveLetterInput(raw) {
   let s = String(raw || '').trim().replace(/[\\/]+$/, '');
   if (/^[A-Za-z]$/.test(s)) s = s.toUpperCase() + ':';
   else if (/^[A-Za-z]:$/.test(s)) s = s[0].toUpperCase() + ':';
-  else throw new Error('Chữ cái ổ đĩa không hợp lệ (ví dụ: V:)');
-  if (s === 'C:') throw new Error('Không thể dùng ổ đĩa hệ thống C:');
+  else throw new Error(t('errInvalidDrive'));
+  if (s === 'C:') throw new Error(t('errReservedC'));
   return s;
 }
 
@@ -1220,7 +1281,7 @@ function normalizePinnedPathsInput(text) {
     let p = line.trim();
     if (!p) continue;
     p = p.replace(/\\/g, '/').replace(/\/+/g, '/');
-    if (p.split('/').includes('..')) throw new Error('Đường dẫn ghim không được chứa ".."');
+    if (p.split('/').includes('..')) throw new Error(t('errPinnedDotDot'));
     if (!p.startsWith('/')) p = '/' + p;
     if (p.length > 1) p = p.replace(/\/+$/, '');
     if (!seen.has(p)) {
@@ -1244,7 +1305,6 @@ function populateDriveSelect(d, force) {
   const allDrives = Array.from({ length: 23 }, (_, i) => String.fromCharCode(68 + i) + ':'); // D:..Z:
   if (!allDrives.includes(cur)) allDrives.unshift(cur);
 
-  // If backend returned available_drives without used_drives, infer occupied letters.
   if (used.size === 0 && avail.length > 0) {
     const availSet = new Set(avail);
     for (const drv of allDrives) {
@@ -1254,7 +1314,7 @@ function populateDriveSelect(d, force) {
     }
   }
 
-  const sig = `${cur}|${mounted}|${[...used].sort().join(',')}`;
+  const sig = `${getLang()}|${cur}|${mounted}|${[...used].sort().join(',')}`;
   if (!force && sig === lastDriveListSig && sel.options.length > 0) {
     return;
   }
@@ -1269,12 +1329,12 @@ function populateDriveSelect(d, force) {
     const isOwnMount = mounted && drv === cur;
     const isUsed = !isOwnMount && used.has(drv);
     if (isOwnMount) {
-      opt.textContent = `${drv} — Đang gắn (TeleMount)`;
+      opt.textContent = t('driveOptMounted', { drv });
     } else if (isUsed) {
-      opt.textContent = drv === cur ? `${drv} — Đang bị ổ khác chiếm (hãy chọn ổ khác)` : `${drv} — Đã được sử dụng`;
+      opt.textContent = drv === cur ? t('driveOptConflict', { drv }) : t('driveOptUsed', { drv });
       opt.disabled = true;
     } else {
-      opt.textContent = `${drv} — Trống`;
+      opt.textContent = t('driveOptFree', { drv });
       if (!firstFree) firstFree = drv;
     }
     sel.appendChild(opt);
@@ -1297,6 +1357,7 @@ async function refreshDriveDropdownLive() {
   lastDriveProbeAt = now;
   try {
     const d = await api('/api/desktop/status');
+    state.lastDesktopStatus = d;
     populateDriveSelect(d, false);
   } catch (_) {}
 }
@@ -1305,6 +1366,7 @@ $('set-desktop-drive').addEventListener('mouseenter', refreshDriveDropdownLive);
 $('set-desktop-drive').addEventListener('focus', refreshDriveDropdownLive);
 
 function populateDesktopSettingsForm(d) {
+  state.lastDesktopStatus = d;
   populateDriveSelect(d, true);
   renderDesktopUpdateUI(d);
   const c = bytesToCacheInput(d.disk_cache_max_bytes || 10 * 1024 * 1024 * 1024);
@@ -1338,7 +1400,7 @@ $('form-desktop-settings').addEventListener('submit', async (e) => {
     const driveLetter = normalizeDriveLetterInput($('set-desktop-drive').value);
     const cacheMaxBytes = cacheInputToBytes($('set-desktop-cache-val').value, $('set-desktop-cache-unit').value);
     if (!Number.isFinite(cacheMaxBytes) || cacheMaxBytes <= 0) {
-      throw new Error('Giới hạn Disk Cache phải lớn hơn 0');
+      throw new Error(t('errCachePositive'));
     }
     const pinnedPaths = normalizePinnedPathsInput($('set-desktop-pinned').value);
 
@@ -1354,7 +1416,7 @@ $('form-desktop-settings').addEventListener('submit', async (e) => {
       }),
     });
     populateDesktopSettingsForm(updated);
-    toast('Đã lưu cài đặt Desktop');
+    toast(t('toastDesktopSaved'));
   } catch (err) {
     errBox.textContent = err.message;
     errBox.classList.remove('hidden');

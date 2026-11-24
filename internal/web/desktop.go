@@ -72,6 +72,11 @@ type UpdateHandler interface {
 	ApplyUpdate(ctx context.Context) error
 }
 
+// LanguageObserver is an optional extension of DesktopController notified when UI language changes.
+type LanguageObserver interface {
+	OnLanguageChange(lang string)
+}
+
 func (s *Server) SetDesktopController(ctrl DesktopController) {
 	s.desktopMu.Lock()
 	defer s.desktopMu.Unlock()

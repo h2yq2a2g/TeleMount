@@ -47,6 +47,7 @@ type LocalState struct {
 	ChannelAccessHash int64                 `json:"channel_access_hash"`
 	ChannelTitle      string                `json:"channel_title"`
 	SetupCompleted    bool                  `json:"setup_completed"`
+	Language          string                `json:"language,omitempty"`
 	BackupAccounts    []BackupAccountConfig `json:"backup_accounts,omitempty"`
 }
 
@@ -288,6 +289,36 @@ func (m *Manager) MarkSetupCompleted() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.state.SetupCompleted = true
+	return m.saveStateLocked()
+}
+
+// NormalizeLanguage returns "vi" for Vietnamese or "en" (default) for everything else.
+func NormalizeLanguage(lang string) string {
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "vi", "vi-vn":
+		return "vi"
+	default:
+		return "en"
+	}
+}
+
+func (m *Manager) Language() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return NormalizeLanguage(m.state.Language)
+}
+
+func (m *Manager) SetLanguage(lang string) error {
+	raw := strings.ToLower(strings.TrimSpace(lang))
+	if raw != "en" && raw != "vi" {
+		return errors.New("unsupported language: expected 'en' or 'vi'")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state.Language == raw {
+		return nil
+	}
+	m.state.Language = raw
 	return m.saveStateLocked()
 }
 

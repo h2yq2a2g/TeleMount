@@ -581,3 +581,67 @@ func TestStaticAssetsDisableBrowserCache(t *testing.T) {
 		}
 	}
 }
+
+type mockLangController struct {
+	*mockDesktopController
+	lastLang string
+}
+
+func (m *mockLangController) OnLanguageChange(lang string) {
+	m.lastLang = lang
+}
+
+func TestLanguageDefaultEnglishSwitchAndAuth(t *testing.T) {
+	srv, _, _, ts := newTestWebServer(t)
+	ctrl := &mockLangController{mockDesktopController: newMockDesktopController()}
+	srv.SetDesktopController(ctrl)
+
+	// Default language must be English ("en").
+	resp, err := http.Get(ts.URL + "/api/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&st)
+	resp.Body.Close()
+	if st["language"] != "en" {
+		t.Fatalf("default language = %v, want en", st["language"])
+	}
+
+	// Setup admin, then verify unauthenticated PUT /api/language is rejected (401).
+	client := setupAndLoginAdmin(t, ts)
+	unauthReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/api/language", strings.NewReader(`{"language":"vi"}`))
+	unauthResp, err := http.DefaultClient.Do(unauthReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated PUT /api/language = %d, want 401", unauthResp.StatusCode)
+	}
+
+	// Authenticated invalid language -> 400.
+	badReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/api/language", strings.NewReader(`{"language":"fr"}`))
+	badResp, err := client.Do(badReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badResp.Body.Close()
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid language status = %d, want 400", badResp.StatusCode)
+	}
+
+	// Authenticated switch to vi -> persists & triggers LanguageObserver.
+	viReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/api/language", strings.NewReader(`{"language":"vi"}`))
+	viResp, err := client.Do(viReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	viResp.Body.Close()
+	if viResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /api/language vi status = %d, want 200", viResp.StatusCode)
+	}
+	if ctrl.lastLang != "vi" {
+		t.Fatalf("OnLanguageChange got %q, want vi", ctrl.lastLang)
+	}
+}

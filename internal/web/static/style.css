@@ -417,6 +417,28 @@ textarea {
 .unit-select { width: 88px; flex: 0 0 88px !important; }
 .banner-title { font-weight: 700; margin-bottom: 4px; }
 
+.lang-switch {
+  display: inline-flex;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 2px;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.lang-btn {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.lang-btn:hover { color: var(--text); }
+.lang-btn.active { background: var(--primary); color: #fff; }
+
 @media (max-width: 780px) {
   .app-shell { grid-template-columns: 1fr; }
   .sidebar { border-right: none; border-bottom: 1px solid var(--border); }

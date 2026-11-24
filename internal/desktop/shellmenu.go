@@ -12,14 +12,26 @@ type ShellMenuSpec struct {
 	Action string
 }
 
-// DefaultShellMenuSpecs returns the OneDrive-style right-click actions for TeleMount drives.
-func DefaultShellMenuSpecs() []ShellMenuSpec {
-	return []ShellMenuSpec{
-		{Key: "01_pin", Label: "Luôn giữ trên thiết bị này (Offline)", Action: "pin"},
-		{Key: "02_free", Label: "Giải phóng dung lượng (Chỉ giữ trên Cloud)", Action: "free"},
-		{Key: "03_sync", Label: "Đồng bộ ngay", Action: "sync"},
-		{Key: "04_status", Label: "Xem trạng thái offline", Action: "status"},
+// ShellMenuSpecs returns the localized OneDrive-style right-click actions for TeleMount drives.
+// Defaults to English ("en"); supports Vietnamese ("vi").
+func ShellMenuSpecs(lang string) []ShellMenuSpec {
+	if strings.EqualFold(strings.TrimSpace(lang), "vi") {
+		return []ShellMenuSpec{
+			{Key: "01_pin", Label: "Luôn giữ trên thiết bị này (Offline)", Action: "pin"},
+			{Key: "02_free", Label: "Giải phóng dung lượng (Chỉ giữ trên Cloud)", Action: "free"},
+			{Key: "03_sync", Label: "Đồng bộ ngay", Action: "sync"},
+		}
 	}
+	return []ShellMenuSpec{
+		{Key: "01_pin", Label: "Always keep on this device", Action: "pin"},
+		{Key: "02_free", Label: "Free up space", Action: "free"},
+		{Key: "03_sync", Label: "Sync now", Action: "sync"},
+	}
+}
+
+// DefaultShellMenuSpecs returns the default (English) OneDrive-style right-click actions.
+func DefaultShellMenuSpecs() []ShellMenuSpec {
+	return ShellMenuSpecs("en")
 }
 
 // MapWindowsPathToVirtual validates that winPath resides on driveLetter (e.g. "V:")

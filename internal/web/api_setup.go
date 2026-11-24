@@ -42,6 +42,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	hasAdmin := s.engine.State().HasAdmin()
 	user, authed := s.isAuthenticated(r)
 	desktopEnabled := s.desktop() != nil
+	lang := s.engine.State().Language()
 
 	// Before login on an already-initialized instance, expose only minimal login-routing flags.
 	if hasAdmin && !authed {
@@ -49,6 +50,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"has_admin":       true,
 			"authenticated":   false,
 			"desktop_enabled": desktopEnabled,
+			"language":        lang,
 		})
 		return
 	}
@@ -60,7 +62,36 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"setup_step":      s.computeSetupStep(),
 		"ready":           s.engine.IsReady(),
 		"desktop_enabled": desktopEnabled,
+		"language":        lang,
 	})
+}
+
+func (s *Server) handleSetLanguage(w http.ResponseWriter, r *http.Request) {
+	// Allow setting language during initial setup (before admin exists) or when authenticated as admin.
+	if s.engine.State().HasAdmin() {
+		if _, ok := s.isAuthenticated(r); !ok {
+			writeErr(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+	}
+	var req struct {
+		Language string `json:"language"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := s.engine.State().SetLanguage(req.Language); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	lang := s.engine.State().Language()
+	if ctrl := s.desktop(); ctrl != nil {
+		if obs, ok := ctrl.(LanguageObserver); ok {
+			obs.OnLanguageChange(lang)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "language": lang})
 }
 
 func (s *Server) handleSetupAdmin(w http.ResponseWriter, r *http.Request) {
@@ -101,7 +132,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.engine.State().VerifyAdmin(strings.TrimSpace(req.Username), req.Password) {
-		writeErr(w, http.StatusUnauthorized, "Sai tên đăng nhập hoặc mật khẩu")
+		writeErr(w, http.StatusUnauthorized, "Invalid username or password")
 		return
 	}
 	s.setSessionCookie(w, r, strings.TrimSpace(req.Username))
@@ -380,7 +411,7 @@ func (s *Server) handleInitKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.Passphrase) < 4 {
-		writeErr(w, http.StatusBadRequest, "Encryption key cần ít nhất 4 ký tự")
+		writeErr(w, http.StatusBadRequest, "Encryption key must be at least 4 characters")
 		return
 	}
 	salt, err := crypto.NewSalt()
@@ -418,7 +449,7 @@ func (s *Server) handleRestoreKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.engine.RestoreDBFromTelegram(r.Context(), req.MsgID, req.Passphrase); err != nil {
 		if errors.Is(err, crypto.ErrDecryptFailed) {
-			writeErr(w, http.StatusBadRequest, "Sai Encryption Key hoặc bản backup bị lỗi xác thực")
+			writeErr(w, http.StatusBadRequest, "Invalid encryption key or corrupted backup")
 			return
 		}
 		writeErr(w, http.StatusBadRequest, err.Error())

@@ -58,6 +58,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) registerRoutes() {
 	// Public auth & bootstrap endpoints
 	s.mux.HandleFunc("GET /api/status", s.handleStatus)
+	s.mux.HandleFunc("PUT /api/language", s.handleSetLanguage)
 	s.mux.HandleFunc("POST /api/setup/admin", s.handleSetupAdmin)
 	s.mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	s.mux.HandleFunc("POST /api/auth/logout", s.handleLogout)

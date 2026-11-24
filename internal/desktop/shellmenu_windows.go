@@ -28,7 +28,7 @@ var windowsShellMenuTargets = []shellMenuTarget{
 
 // RegisterShellMenu installs the per-user Windows Explorer right-click submenu
 // scoped strictly to driveLetter via Windows AppliesTo AQS filters (no admin required).
-func RegisterShellMenu(exePath, driveLetter string) error {
+func RegisterShellMenu(exePath, driveLetter, lang string) error {
 	exe := strings.TrimSpace(exePath)
 	if exe == "" {
 		return errors.New("executable path required")
@@ -39,7 +39,7 @@ func RegisterShellMenu(exePath, driveLetter string) error {
 	}
 
 	iconVal := fmt.Sprintf(`"%s",0`, exe)
-	specs := DefaultShellMenuSpecs()
+	specs := ShellMenuSpecs(lang)
 
 	for _, t := range windowsShellMenuTargets {
 		// Clear previous subkeys first so old items never linger across upgrades.
