@@ -253,6 +253,23 @@ CREATE TABLE IF NOT EXISTS pending_replica_deletes (
 	created_at INTEGER NOT NULL,
 	PRIMARY KEY (account_id, replica_msg_id)
 );
+
+CREATE TABLE IF NOT EXISTS upload_checkpoints (
+	upload_key TEXT NOT NULL,
+	part_index INTEGER NOT NULL,
+	tg_msg_id INTEGER NOT NULL,
+	tg_file_id INTEGER NOT NULL,
+	tg_access_hash INTEGER NOT NULL,
+	tg_file_ref BLOB,
+	tg_dc_id INTEGER NOT NULL,
+	plain_size INTEGER NOT NULL,
+	cipher_size INTEGER NOT NULL,
+	part_header BLOB NOT NULL,
+	total_size INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (upload_key, part_index)
+);
+CREATE INDEX IF NOT EXISTS idx_upload_checkpoints_msg ON upload_checkpoints(tg_msg_id);
 `
 	if _, err := conn.Exec(schema); err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
@@ -548,7 +565,7 @@ func releaseUnreferencedMsgIDsTx(tx *sql.Tx, candidates []int, now int64) ([]int
 		seen[mid] = struct{}{}
 
 		var refCount int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM file_parts WHERE tg_msg_id = ?`, mid).Scan(&refCount); err != nil {
+		if err := tx.QueryRow(`SELECT (SELECT COUNT(*) FROM file_parts WHERE tg_msg_id = ?) + (SELECT COUNT(*) FROM upload_checkpoints WHERE tg_msg_id = ?)`, mid, mid).Scan(&refCount); err != nil {
 			return nil, err
 		}
 		if refCount == 0 {
@@ -1226,7 +1243,10 @@ func (s *Store) AllReferencedMsgIDs() (map[int]struct{}, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make(map[int]struct{})
-	rows, err := s.conn.Query(`SELECT tg_msg_id FROM file_parts WHERE tg_msg_id > 0 UNION SELECT tg_msg_id FROM packs WHERE tg_msg_id > 0`)
+	rows, err := s.conn.Query(`
+		SELECT tg_msg_id FROM file_parts WHERE tg_msg_id > 0
+		UNION SELECT tg_msg_id FROM packs WHERE tg_msg_id > 0
+		UNION SELECT tg_msg_id FROM upload_checkpoints WHERE tg_msg_id > 0`)
 	if err != nil {
 		return nil, err
 	}
@@ -1239,6 +1259,87 @@ func (s *Store) AllReferencedMsgIDs() (map[int]struct{}, error) {
 		out[mid] = struct{}{}
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) GetUploadCheckpoint(uploadKey string) ([]FilePart, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.conn.Query(`
+		SELECT part_index, tg_msg_id, tg_file_id, tg_access_hash, tg_file_ref, tg_dc_id, plain_size, cipher_size, part_header
+		FROM upload_checkpoints WHERE upload_key = ? ORDER BY part_index ASC`, uploadKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FilePart
+	for rows.Next() {
+		var p FilePart
+		if err := rows.Scan(&p.PartIndex, &p.TGMsgID, &p.TGFileID, &p.TGAccessHash, &p.TGFileRef, &p.TGDCID, &p.PlainSize, &p.CipherSize, &p.PartHeader); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SaveUploadCheckpointPart(uploadKey string, totalSize int64, p FilePart) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.conn.Exec(`
+		INSERT OR REPLACE INTO upload_checkpoints
+			(upload_key, part_index, tg_msg_id, tg_file_id, tg_access_hash, tg_file_ref, tg_dc_id, plain_size, cipher_size, part_header, total_size, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		uploadKey, p.PartIndex, p.TGMsgID, p.TGFileID, p.TGAccessHash, p.TGFileRef, p.TGDCID, p.PlainSize, p.CipherSize, p.PartHeader, totalSize, time.Now().Unix(),
+	)
+	return err
+}
+
+func (s *Store) ClearUploadCheckpoint(uploadKey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.conn.Exec(`DELETE FROM upload_checkpoints WHERE upload_key = ?`, uploadKey)
+	return err
+}
+
+func (s *Store) PruneStaleUploadCheckpoints(maxAge time.Duration) ([]int, error) {
+	cutoff := time.Now().Add(-maxAge).Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.conn.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT tg_msg_id FROM upload_checkpoints WHERE updated_at < ? AND tg_msg_id > 0`, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	var candidates []int
+	for rows.Next() {
+		var mid int
+		if err := rows.Scan(&mid); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		candidates = append(candidates, mid)
+	}
+	rows.Close()
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	if _, err := tx.Exec(`DELETE FROM upload_checkpoints WHERE updated_at < ?`, cutoff); err != nil {
+		return nil, err
+	}
+	releasable, err := releaseUnreferencedMsgIDsTx(tx, candidates, time.Now().Unix())
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return releasable, nil
 }
 
 func (s *Store) Search(query string, limit int) ([]NodeWithPath, error) {

@@ -258,7 +258,7 @@ const I18N = {
     toastSettingsSaved: 'Storage & RAM settings saved',
 
     backupCardTitle: 'Encrypted DB Backup & Restore on Telegram',
-    backupCardDescHtml: 'SQLite snapshot is created in <code>/tmp</code>, compressed & encrypted with Argon2id + AES-256-GCM, then uploaded to your Channel.',
+    backupCardDescHtml: 'Compresses &amp; encrypts your SQLite catalog with Argon2id + AES-256-GCM and keeps only the latest backup on Telegram (older backups are automatically deleted).',
     btnBackupNow: 'Backup DB Now',
     btnLoadBackups: 'List Backups',
     lastBackupLine: 'Last backup: {time} (msg #{id})',
@@ -558,7 +558,7 @@ const I18N = {
     toastSettingsSaved: 'Đã lưu cài đặt Hybrid Pack & RAM cache',
 
     backupCardTitle: 'Sao lưu & Khôi phục DB lên Telegram',
-    backupCardDescHtml: 'Snapshot SQLite được tạo trong <code>/tmp</code>, nén &amp; mã hóa bằng Argon2id + AES-256-GCM rồi đẩy lên Channel.',
+    backupCardDescHtml: 'Nén &amp; mã hóa danh mục SQLite bằng Argon2id + AES-256-GCM và chỉ giữ 1 bản sao lưu mới nhất trên Telegram (tự động xóa bản cũ khi có bản mới).',
     btnBackupNow: 'Backup DB ngay',
     btnLoadBackups: 'Xem danh sách backup',
     lastBackupLine: 'Lần backup gần nhất: {time} (msg #{id})',

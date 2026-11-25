@@ -502,7 +502,7 @@
 
           <div class="card">
             <h3 data-i18n="backupCardTitle">Encrypted DB Backup &amp; Restore on Telegram</h3>
-            <p class="muted small" data-i18n-html="backupCardDescHtml">SQLite snapshot is created in <code>/tmp</code>, compressed &amp; encrypted with Argon2id + AES-256-GCM, then uploaded to your Channel.</p>
+            <p class="muted small" data-i18n-html="backupCardDescHtml">Compresses &amp; encrypts your SQLite catalog with Argon2id + AES-256-GCM and keeps only the latest backup on Telegram (older backups are automatically deleted).</p>
             <div class="row-inline">
               <button class="btn btn-primary" id="btn-backup-now" data-i18n="btnBackupNow">Backup DB Now</button>
               <button class="btn btn-secondary" id="btn-load-backups" data-i18n="btnLoadBackups">List Backups</button>
@@ -592,7 +592,7 @@
     </div>
   </div>
 
-  <script src="/i18n.js?v=1.0.7"></script>
-  <script src="/app.js?v=1.0.7"></script>
+  <script src="/i18n.js?v=1.0.11"></script>
+  <script src="/app.js?v=1.0.11"></script>
 </body>
 </html>

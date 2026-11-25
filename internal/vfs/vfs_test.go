@@ -144,6 +144,106 @@ func TestTeleFSOpenRDWRIsLazyAndUtimensBeforeFlushPreservesMtime(t *testing.T) {
 	_ = fs.Release("/copy.bin", rwfh)
 }
 
+func TestTeleFSProtectedTrashFolderAndMoveOnDelete(t *testing.T) {
+	fs, _ := newTestFS(t)
+
+	// /Trash must always appear at root and cannot be deleted or renamed.
+	var names []string
+	if rc := fs.Readdir("/", func(name string, _ *fuse.Stat_t, _ int64) bool {
+		names = append(names, name)
+		return true
+	}, 0, 0); rc != 0 {
+		t.Fatalf("Readdir(/) rc=%d", rc)
+	}
+	foundTrash := false
+	for _, n := range names {
+		if n == "Trash" {
+			foundTrash = true
+		}
+	}
+	if !foundTrash {
+		t.Fatalf("Readdir(/) = %v, missing protected Trash folder", names)
+	}
+	var st fuse.Stat_t
+	if rc := fs.Getattr("/Trash", &st, 0); rc != 0 || st.Mode&fuse.S_IFDIR == 0 {
+		t.Fatalf("Getattr(/Trash) = (rc=%d, mode=%o)", rc, st.Mode)
+	}
+	if rc := fs.Rmdir("/Trash"); rc != -fuse.EACCES {
+		t.Fatalf("Rmdir(/Trash) = %d, want -EACCES", rc)
+	}
+	if rc := fs.Unlink("/Trash"); rc != -fuse.EACCES {
+		t.Fatalf("Unlink(/Trash) = %d, want -EACCES", rc)
+	}
+	if rc := fs.Rename("/Trash", "/Trash2"); rc != -fuse.EACCES {
+		t.Fatalf("Rename(/Trash -> /Trash2) = %d, want -EACCES", rc)
+	}
+
+	// Deleting files outside /Trash moves them into /Trash (collision-safe).
+	writeFile := func(p string, content []byte) {
+		rc, fh := fs.Create(p, fuse.O_CREAT|fuse.O_WRONLY|fuse.O_TRUNC, 0o644)
+		if rc != 0 {
+			t.Fatalf("Create(%s) rc=%d", p, rc)
+		}
+		if n := fs.Write(p, content, 0, fh); n != len(content) {
+			t.Fatalf("Write(%s) = %d", p, n)
+		}
+		_ = fs.Flush(p, fh)
+		_ = fs.Release(p, fh)
+	}
+	readFile := func(p string, size int) []byte {
+		rc, fh := fs.Open(p, fuse.O_RDONLY)
+		if rc != 0 {
+			t.Fatalf("Open(%s) rc=%d", p, rc)
+		}
+		buf := make([]byte, size)
+		n := fs.Read(p, buf, 0, fh)
+		_ = fs.Release(p, fh)
+		return buf[:max(0, n)]
+	}
+
+	_ = fs.Mkdir("/docs", 0o755)
+	_ = fs.Mkdir("/other", 0o755)
+	writeFile("/docs/report.txt", []byte("first-version"))
+	writeFile("/other/report.txt", []byte("second-version"))
+
+	if rc := fs.Rename("/docs/report.txt", "/Trash"); rc != -fuse.EACCES {
+		t.Fatalf("Rename onto /Trash = %d, want -EACCES", rc)
+	}
+	if rc := fs.Unlink("/docs/report.txt"); rc != 0 {
+		t.Fatalf("Unlink(/docs/report.txt) rc=%d", rc)
+	}
+	if rc := fs.Getattr("/docs/report.txt", &st, 0); rc != -fuse.ENOENT {
+		t.Fatalf("expected /docs/report.txt moved out, rc=%d", rc)
+	}
+	if got := string(readFile("/Trash/report.txt", 13)); got != "first-version" {
+		t.Fatalf("/Trash/report.txt = %q, want first-version", got)
+	}
+
+	// Second file with same basename must not overwrite first file in /Trash.
+	if rc := fs.Unlink("/other/report.txt"); rc != 0 {
+		t.Fatalf("Unlink(/other/report.txt) rc=%d", rc)
+	}
+	if got := string(readFile("/Trash/report (2).txt", 14)); got != "second-version" {
+		t.Fatalf("/Trash/report (2).txt = %q, want second-version", got)
+	}
+
+	// Dragging back out of /Trash restores instantly.
+	if rc := fs.Rename("/Trash/report.txt", "/docs/report.txt"); rc != 0 {
+		t.Fatalf("restore Rename rc=%d", rc)
+	}
+	if got := string(readFile("/docs/report.txt", 13)); got != "first-version" {
+		t.Fatalf("restored /docs/report.txt = %q, want first-version", got)
+	}
+
+	// Deleting inside /Trash deletes permanently.
+	if rc := fs.Unlink("/Trash/report (2).txt"); rc != 0 {
+		t.Fatalf("permanent Unlink inside /Trash rc=%d", rc)
+	}
+	if rc := fs.Getattr("/Trash/report (2).txt", &st, 0); rc != -fuse.ENOENT {
+		t.Fatalf("expected permanent delete inside /Trash, rc=%d", rc)
+	}
+}
+
 func TestMountManagerRejectsMissingWinFspSafely(t *testing.T) {
 	fs, _ := newTestFS(t)
 	probe := &stubProbe{st: desktop.WinFspStatus{Installed: false, Guidance: "Install WinFsp from https://winfsp.dev"}}

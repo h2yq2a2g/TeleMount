@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	"path/filepath"
 	"strings"
@@ -18,13 +19,15 @@ import (
 )
 
 type mockTG struct {
-	mu         sync.Mutex
-	authorized bool
-	nextID     int
-	docs       map[int]*mockDoc
-	sourceRef  *mockTG // simulates Telegram cloud server-side copy from source channel
-	tracker    *tg.Tracker
-	fetches    int
+	mu           sync.Mutex
+	authorized   bool
+	nextID       int
+	docs         map[int]*mockDoc
+	sourceRef    *mockTG // simulates Telegram cloud server-side copy from source channel
+	tracker      *tg.Tracker
+	fetches      int
+	uploadCalls  int
+	failUploadAt int // 1-based upload call to fail once
 }
 
 type mockDoc struct {
@@ -94,6 +97,16 @@ func (m *mockTG) ForwardCopyDoc(_ context.Context, _, _ int64, srcMsgID int) (*t
 }
 
 func (m *mockTG) UploadBlob(_ context.Context, fileName, caption string, r io.Reader, _ int64, _ int, onProgress func(done int64)) (*tg.UploadedDoc, error) {
+	m.mu.Lock()
+	m.uploadCalls++
+	shouldFail := m.failUploadAt > 0 && m.uploadCalls == m.failUploadAt
+	if shouldFail {
+		m.failUploadAt = 0
+	}
+	m.mu.Unlock()
+	if shouldFail {
+		return nil, errors.New("injected network drop during upload")
+	}
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
@@ -617,6 +630,147 @@ func TestFileReaderSequentialReadAheadAndCleanClose(t *testing.T) {
 	}
 	if err := fr.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestDBBackupKeepsOnlyLatestSingleBackup(t *testing.T) {
+	dir := t.TempDir()
+	store, err := db.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt, _ := crypto.NewSalt()
+	key := crypto.DeriveMasterKey("secret-pass", salt)
+	_ = st.SetAdmin("admin", "pass1234")
+	_ = st.SetMasterKey(key, salt)
+	_ = st.SetChannel(1001, 2002, "SingleBackupChan")
+	mock := newMockTG()
+	eng := NewEngine(store, st, mock, filepath.Join(dir, "tmp"))
+
+	ctx := context.Background()
+	var lastDoc *tg.UploadedDoc
+	for i := 0; i < 3; i++ {
+		d, err := eng.BackupDBToTelegram(ctx)
+		if err != nil {
+			t.Fatalf("BackupDBToTelegram #%d: %v", i+1, err)
+		}
+		lastDoc = d
+	}
+
+	backups, err := eng.ListChannelBackups(ctx)
+	if err != nil {
+		t.Fatalf("ListChannelBackups: %v", err)
+	}
+	if len(backups) != 1 || backups[0].MsgID != lastDoc.MsgID {
+		t.Fatalf("expected exactly 1 latest DB backup (msg #%d), got %+v", lastDoc.MsgID, backups)
+	}
+}
+
+func TestMultiPartUploadCheckpointResumeAndCrossPartReadAhead(t *testing.T) {
+	dir := t.TempDir()
+	store, err := db.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt, _ := crypto.NewSalt()
+	key := crypto.DeriveMasterKey("secret-pass", salt)
+	_ = st.SetAdmin("admin", "pass1234")
+	_ = st.SetMasterKey(key, salt)
+	_ = st.SetChannel(1001, 2002, "ResumeChan")
+
+	cfg, _ := store.GetSettings()
+	cfg.SmallFileMaxMB = 0
+	cfg.PartSizeMB = 10
+	if err := store.SaveSettings(cfg); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	mock := newMockTG()
+	mock.failUploadAt = 2 // fail on part #2 of 2!
+	eng := NewEngine(store, st, mock, filepath.Join(dir, "tmp"))
+
+	// 11 MiB file -> Part 0 (10 MiB) + Part 1 (1 MiB).
+	payload := make([]byte, 11<<20)
+	for i := range payload {
+		payload[i] = byte((i*31 + i/1021) % 251)
+	}
+	ctx := context.Background()
+
+	// Attempt 1: Part 0 uploads & checkpoints; Part 1 fails -> Part 0 must NOT be deleted!
+	if _, err := eng.UploadFile(ctx, db.RootID, "big.bin", "application/octet-stream", bytes.NewReader(payload), int64(len(payload))); err == nil {
+		t.Fatal("expected first UploadFile attempt to fail on part #2")
+	}
+	mock.mu.Lock()
+	docsAfterFail := len(mock.docs)
+	callsAfterFail := mock.uploadCalls
+	mock.mu.Unlock()
+	if docsAfterFail != 1 || callsAfterFail != 2 {
+		t.Fatalf("expected part 0 preserved in TG (docs=1, calls=2), got docs=%d calls=%d", docsAfterFail, callsAfterFail)
+	}
+	refs, err := store.AllReferencedMsgIDs()
+	if err != nil || len(refs) != 1 {
+		t.Fatalf("expected checkpointed part protected in AllReferencedMsgIDs, got %v (err=%v)", refs, err)
+	}
+
+	// Attempt 2: resumes from checkpoint and uploads ONLY Part 1!
+	node, err := eng.UploadFile(ctx, db.RootID, "big.bin", "application/octet-stream", bytes.NewReader(payload), int64(len(payload)))
+	if err != nil {
+		t.Fatalf("resumed UploadFile: %v", err)
+	}
+	mock.mu.Lock()
+	totalCalls := mock.uploadCalls
+	totalDocs := len(mock.docs)
+	mock.mu.Unlock()
+	if totalCalls != 3 || totalDocs != 2 {
+		t.Fatalf("expected resume to upload only part 1 (totalCalls=3, totalDocs=2), got calls=%d docs=%d", totalCalls, totalDocs)
+	}
+
+	// Verify decrypted content intact and sequential read across the 10 MiB part boundary triggers cross-part read-ahead.
+	fr, err := eng.OpenFile(ctx, node)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer fr.Close()
+
+	// Read sequentially starting 1.5 MiB before the 10 MiB boundary up to 10 MiB (crossing chunks 17, 18, 19 of part 0).
+	startOff := int64(10<<20) - int64(1536*1024)
+	buf := make([]byte, 1536*1024)
+	if n, err := fr.ReadAt(buf, startOff); err != nil || n != len(buf) || !bytes.Equal(buf, payload[startOff:startOff+int64(len(buf))]) {
+		t.Fatalf("pre-boundary read = (%d, %v)", n, err)
+	}
+	// Part 1 chunk 0 should be prefetched asynchronously across the part boundary!
+	parts, _ := store.GetFileParts(node.ID)
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 file parts, got %d", len(parts))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if eng.Cache().HasOrInflight(parts[1].TGMsgID, 0) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !eng.Cache().HasOrInflight(parts[1].TGMsgID, 0) {
+		t.Fatal("expected cross-part read-ahead to prefetch part 1 chunk 0")
+	}
+
+	// Verify tail bytes in part 1 decrypt cleanly too.
+	tail := make([]byte, 4096)
+	tailOff := int64(len(payload) - 4096)
+	if n, err := fr.ReadAt(tail, tailOff); err != nil || n != len(tail) || !bytes.Equal(tail, payload[tailOff:]) {
+		t.Fatalf("part 1 tail read = (%d, %v)", n, err)
 	}
 }
 

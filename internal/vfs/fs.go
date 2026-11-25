@@ -5,6 +5,7 @@ package vfs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path"
@@ -22,6 +23,7 @@ import (
 const (
 	defaultBlockSize   uint64 = 4096
 	defaultTotalBlocks uint64 = (1024 * 1024 * 1024 * 1024) / defaultBlockSize // 1 TiB virtual cloud drive capacity
+	trashDirPath              = "/Trash"
 )
 
 type openHandle struct {
@@ -53,6 +55,9 @@ type TeleFS struct {
 	initMu   sync.Mutex
 	initCh   chan struct{}
 	initDone bool
+
+	trashMu  sync.Mutex
+	bootTime int64
 }
 
 var (
@@ -62,10 +67,84 @@ var (
 
 func NewTeleFS(store *db.Store, cache *diskcache.Manager) *TeleFS {
 	return &TeleFS{
-		store:   store,
-		cache:   cache,
-		handles: make(map[uint64]*openHandle),
+		store:    store,
+		cache:    cache,
+		handles:  make(map[uint64]*openHandle),
+		bootTime: time.Now().Unix(),
 	}
+}
+
+func isTrashRoot(normPath string) bool {
+	return strings.EqualFold(normPath, trashDirPath)
+}
+
+func isInsideTrash(normPath string) bool {
+	return strings.HasPrefix(strings.ToLower(normPath), "/trash/")
+}
+
+func (f *TeleFS) ensureTrashDirLocked() int {
+	ov, found, err := f.cache.Stat(trashDirPath)
+	if err != nil {
+		return mapErr(err)
+	}
+	if found {
+		if !ov.IsDir {
+			return -fuse.ENOTDIR
+		}
+		return 0
+	}
+	if err := f.cache.QueueMkdir(context.Background(), trashDirPath); err != nil && !errors.Is(err, os.ErrExist) {
+		return mapErr(err)
+	}
+	return 0
+}
+
+func (f *TeleFS) ensureTrashDir() int {
+	f.trashMu.Lock()
+	defer f.trashMu.Unlock()
+	return f.ensureTrashDirLocked()
+}
+
+func (f *TeleFS) pickTrashDestLocked(srcPath string) (string, error) {
+	base := path.Base(srcPath)
+	candidate := trashDirPath + "/" + base
+	if _, exists, err := f.cache.Stat(candidate); err != nil {
+		return "", err
+	} else if !exists {
+		return candidate, nil
+	}
+	ext := path.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	for i := 2; i < 10000; i++ {
+		candidate = fmt.Sprintf("%s/%s (%d)%s", trashDirPath, stem, i, ext)
+		exists, err := func() (bool, error) {
+			_, ex, serr := f.cache.Stat(candidate)
+			return ex, serr
+		}()
+		if err != nil {
+			return "", err
+		}
+		if !exists {
+			return candidate, nil
+		}
+	}
+	return fmt.Sprintf("%s/%s (%d)%s", trashDirPath, stem, time.Now().UnixNano(), ext), nil
+}
+
+func (f *TeleFS) moveToTrash(srcPath string) int {
+	f.trashMu.Lock()
+	defer f.trashMu.Unlock()
+	if rc := f.ensureTrashDirLocked(); rc != 0 {
+		return rc
+	}
+	dest, err := f.pickTrashDestLocked(srcPath)
+	if err != nil {
+		return mapErr(err)
+	}
+	if err := f.cache.QueueRename(context.Background(), srcPath, dest); err != nil {
+		return mapErr(err)
+	}
+	return 0
 }
 
 func (f *TeleFS) resetInitSignal() chan struct{} {
@@ -276,6 +355,9 @@ func (f *TeleFS) Getpath(p string, fh uint64) (int, string) {
 	} else if found {
 		return 0, ov.Path
 	}
+	if isTrashRoot(norm) {
+		return 0, trashDirPath
+	}
 	if h := f.findOpenDirtyByPath(norm); h != nil {
 		h.mu.Lock()
 		cp := h.path
@@ -320,6 +402,10 @@ func (f *TeleFS) Getattr(p string, stat *fuse.Stat_t, fh uint64) int {
 		return mapErr(err)
 	}
 	if !found {
+		if isTrashRoot(norm) {
+			fillStat(stat, true, 0, f.bootTime, f.bootTime)
+			return 0
+		}
 		return -fuse.ENOENT
 	}
 	fillStat(stat, ov.IsDir, ov.Size, ov.Mtime, ov.Ctime)
@@ -359,6 +445,9 @@ func (f *TeleFS) Opendir(p string) (int, uint64) {
 		return mapErr(err), ^uint64(0)
 	}
 	if !found {
+		if isTrashRoot(norm) {
+			return 0, f.registerHandle(&openHandle{path: trashDirPath})
+		}
 		return -fuse.ENOENT, ^uint64(0)
 	}
 	if !ov.IsDir {
@@ -376,11 +465,15 @@ func (f *TeleFS) Readdir(p string, fill func(name string, stat *fuse.Stat_t, ofs
 	}
 	children, err := f.cache.ListDir(dirPath)
 	if err != nil {
-		return mapErr(err)
+		if errors.Is(err, os.ErrNotExist) && isTrashRoot(dirPath) {
+			children = nil
+		} else {
+			return mapErr(err)
+		}
 	}
 
 	var dirStat fuse.Stat_t
-	fillStat(&dirStat, true, 0, time.Now().Unix(), time.Now().Unix())
+	fillStat(&dirStat, true, 0, f.bootTime, f.bootTime)
 	if !fill(".", &dirStat, 0) {
 		return 0
 	}
@@ -388,7 +481,7 @@ func (f *TeleFS) Readdir(p string, fill func(name string, stat *fuse.Stat_t, ofs
 		return 0
 	}
 
-	seen := make(map[string]struct{}, len(children))
+	seen := make(map[string]struct{}, len(children)+1)
 	for _, ch := range children {
 		name := path.Base(ch.Path)
 		seen[strings.ToLower(name)] = struct{}{}
@@ -396,6 +489,14 @@ func (f *TeleFS) Readdir(p string, fill func(name string, stat *fuse.Stat_t, ofs
 		fillStat(&st, ch.IsDir, ch.Size, ch.Mtime, ch.Ctime)
 		if !fill(name, &st, 0) {
 			return 0
+		}
+	}
+	if dirPath == "/" {
+		if _, ok := seen["trash"]; !ok {
+			seen["trash"] = struct{}{}
+			if !fill("Trash", &dirStat, 0) {
+				return 0
+			}
 		}
 	}
 
@@ -447,8 +548,13 @@ func (f *TeleFS) Releasedir(_ string, fh uint64) int {
 
 func (f *TeleFS) Mkdir(p string, _ uint32) int {
 	norm := diskcache.NormalizePath(p)
-	if norm == "/" {
+	if norm == "/" || isTrashRoot(norm) {
 		return -fuse.EEXIST
+	}
+	if isInsideTrash(norm) {
+		if rc := f.ensureTrashDir(); rc != 0 {
+			return rc
+		}
 	}
 	parentPath := parentDir(norm)
 	pov, pfound, err := f.cache.Stat(parentPath)
@@ -477,6 +583,9 @@ func (f *TeleFS) Rmdir(p string) int {
 	if norm == "/" {
 		return -fuse.EBUSY
 	}
+	if isTrashRoot(norm) {
+		return -fuse.EACCES
+	}
 	ov, found, err := f.cache.Stat(norm)
 	if err != nil {
 		return mapErr(err)
@@ -494,16 +603,22 @@ func (f *TeleFS) Rmdir(p string) int {
 	if len(children) > 0 {
 		return -fuse.ENOTEMPTY
 	}
-	if err := f.cache.QueueDelete(context.Background(), ov.Path, true); err != nil {
-		return mapErr(err)
+	if isInsideTrash(ov.Path) {
+		if err := f.cache.QueueDelete(context.Background(), ov.Path, true); err != nil {
+			return mapErr(err)
+		}
+		return 0
 	}
-	return 0
+	return f.moveToTrash(ov.Path)
 }
 
 func (f *TeleFS) Unlink(p string) int {
 	norm := diskcache.NormalizePath(p)
 	if norm == "/" {
 		return -fuse.EISDIR
+	}
+	if isTrashRoot(norm) {
+		return -fuse.EACCES
 	}
 	ov, found, err := f.cache.Stat(norm)
 	if err != nil {
@@ -515,10 +630,13 @@ func (f *TeleFS) Unlink(p string) int {
 	if ov.IsDir {
 		return -fuse.EISDIR
 	}
-	if err := f.cache.QueueDelete(context.Background(), ov.Path, false); err != nil {
-		return mapErr(err)
+	if isInsideTrash(ov.Path) {
+		if err := f.cache.QueueDelete(context.Background(), ov.Path, false); err != nil {
+			return mapErr(err)
+		}
+		return 0
 	}
-	return 0
+	return f.moveToTrash(ov.Path)
 }
 
 func (f *TeleFS) Rename(oldpath, newpath string) int {
@@ -526,6 +644,14 @@ func (f *TeleFS) Rename(oldpath, newpath string) int {
 	newNorm := diskcache.NormalizePath(newpath)
 	if oldNorm == "/" || newNorm == "/" {
 		return -fuse.EINVAL
+	}
+	if isTrashRoot(oldNorm) || isTrashRoot(newNorm) {
+		return -fuse.EACCES
+	}
+	if isInsideTrash(newNorm) {
+		if rc := f.ensureTrashDir(); rc != 0 {
+			return rc
+		}
 	}
 
 	// Flush any active dirty handle on oldpath so the renamed target gets the latest written bytes.
@@ -607,8 +733,13 @@ func (f *TeleFS) Rename(oldpath, newpath string) int {
 
 func (f *TeleFS) Create(p string, flags int, _ uint32) (int, uint64) {
 	norm := diskcache.NormalizePath(p)
-	if norm == "/" {
+	if norm == "/" || isTrashRoot(norm) {
 		return -fuse.EISDIR, ^uint64(0)
+	}
+	if isInsideTrash(norm) {
+		if rc := f.ensureTrashDir(); rc != 0 {
+			return rc, ^uint64(0)
+		}
 	}
 	parentPath := parentDir(norm)
 	pov, pfound, err := f.cache.Stat(parentPath)
@@ -663,7 +794,7 @@ func (f *TeleFS) Create(p string, flags int, _ uint32) (int, uint64) {
 
 func (f *TeleFS) Open(p string, flags int) (int, uint64) {
 	norm := diskcache.NormalizePath(p)
-	if norm == "/" {
+	if norm == "/" || isTrashRoot(norm) {
 		return -fuse.EISDIR, ^uint64(0)
 	}
 	ov, found, err := f.cache.Stat(norm)
@@ -927,6 +1058,9 @@ func (f *TeleFS) Utimens(p string, tmsp []fuse.Timespec) int {
 		return mapErr(err)
 	}
 	if !found {
+		if isTrashRoot(norm) {
+			return 0
+		}
 		return -fuse.ENOENT
 	}
 
@@ -942,33 +1076,36 @@ func (f *TeleFS) Utimens(p string, tmsp []fuse.Timespec) int {
 }
 
 func (f *TeleFS) Chmod(p string, _ uint32) int {
-	_, found, err := f.cache.Stat(diskcache.NormalizePath(p))
+	norm := diskcache.NormalizePath(p)
+	_, found, err := f.cache.Stat(norm)
 	if err != nil {
 		return mapErr(err)
 	}
-	if !found {
+	if !found && !isTrashRoot(norm) {
 		return -fuse.ENOENT
 	}
 	return 0
 }
 
 func (f *TeleFS) Chown(p string, _, _ uint32) int {
-	_, found, err := f.cache.Stat(diskcache.NormalizePath(p))
+	norm := diskcache.NormalizePath(p)
+	_, found, err := f.cache.Stat(norm)
 	if err != nil {
 		return mapErr(err)
 	}
-	if !found {
+	if !found && !isTrashRoot(norm) {
 		return -fuse.ENOENT
 	}
 	return 0
 }
 
 func (f *TeleFS) Access(p string, _ uint32) int {
-	_, found, err := f.cache.Stat(diskcache.NormalizePath(p))
+	norm := diskcache.NormalizePath(p)
+	_, found, err := f.cache.Stat(norm)
 	if err != nil {
 		return mapErr(err)
 	}
-	if !found {
+	if !found && !isTrashRoot(norm) {
 		return -fuse.ENOENT
 	}
 	return 0

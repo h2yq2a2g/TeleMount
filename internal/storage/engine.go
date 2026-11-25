@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -25,7 +26,7 @@ import (
 const (
 	DBBackupPrefix       = "telemount-db-backup-"
 	legacyDBBackupPrefix = "teledrive-db-backup-"
-	DBBackupKeepCount    = 5
+	DBBackupKeepCount    = 1
 )
 
 var (
@@ -103,6 +104,9 @@ func (e *Engine) StartBackgroundTasks(ctx context.Context) {
 				if e.IsReady() {
 					_ = e.FlushPendingDeletes(ctx)
 					e.FlushPendingReplicaDeletes(ctx)
+					if stale, err := e.store.PruneStaleUploadCheckpoints(7 * 24 * time.Hour); err == nil && len(stale) > 0 {
+						go e.deleteBestEffort(stale)
+					}
 				}
 			case <-syncTicker.C:
 				if e.IsReady() && len(e.state.BackupAccounts()) > 0 {
@@ -211,8 +215,13 @@ func (e *Engine) UploadFile(ctx context.Context, parentID int64, name, mimeType 
 	var uploadedMsgIDs []int
 	var totalPlain int64
 	var completedBytes int64
+	var uploadKey string
 
 	cleanupUploaded := func() {
+		// Resumable multi-part uploads preserve already-checkpointed parts so retries continue from the failed part.
+		if uploadKey != "" {
+			return
+		}
 		if len(uploadedMsgIDs) > 0 {
 			_ = e.tg.DeleteMessages(context.Background(), uploadedMsgIDs)
 		}
@@ -220,6 +229,36 @@ func (e *Engine) UploadFile(ctx context.Context, parentID int64, name, mimeType 
 
 	if knownSize > 0 {
 		remaining := knownSize
+		if rs, ok := r.(io.ReadSeeker); ok && knownSize > partSize {
+			if key, ok := computeResumableUploadKey(parentID, name, knownSize, partSize, rs); ok {
+				uploadKey = key
+				if saved, err := e.store.GetUploadCheckpoint(uploadKey); err == nil && len(saved) > 0 {
+					var resumedBytes int64
+					valid := true
+					for i, sp := range saved {
+						wantPlain := knownSize - resumedBytes
+						if wantPlain > partSize {
+							wantPlain = partSize
+						}
+						if sp.PartIndex != i || sp.PlainSize != wantPlain || sp.CipherSize != crypto.CipherSize(wantPlain) || sp.TGMsgID <= 0 {
+							valid = false
+							break
+						}
+						resumedBytes += sp.PlainSize
+					}
+					if valid && resumedBytes > 0 && resumedBytes < knownSize {
+						if _, serr := rs.Seek(resumedBytes, io.SeekStart); serr == nil {
+							parts = append(parts, saved...)
+							completedBytes = resumedBytes
+							totalPlain = resumedBytes
+							remaining = knownSize - resumedBytes
+							e.tg.Tracker().UpdateTransfer(trID, completedBytes)
+						}
+					}
+				}
+			}
+		}
+
 		for remaining > 0 {
 			thisPlain := remaining
 			if thisPlain > partSize {
@@ -253,7 +292,7 @@ func (e *Engine) UploadFile(ctx context.Context, parentID int64, name, mimeType 
 			}
 
 			uploadedMsgIDs = append(uploadedMsgIDs, doc.MsgID)
-			parts = append(parts, db.FilePart{
+			part := db.FilePart{
 				PartIndex:    len(parts),
 				TGMsgID:      doc.MsgID,
 				TGFileID:     doc.FileID,
@@ -263,7 +302,11 @@ func (e *Engine) UploadFile(ctx context.Context, parentID int64, name, mimeType 
 				PlainSize:    thisPlain,
 				CipherSize:   thisCipher,
 				PartHeader:   append([]byte(nil), hdr[:]...),
-			})
+			}
+			if uploadKey != "" {
+				_ = e.store.SaveUploadCheckpointPart(uploadKey, knownSize, part)
+			}
+			parts = append(parts, part)
 			completedBytes += thisPlain
 			totalPlain += thisPlain
 			remaining -= thisPlain
@@ -344,6 +387,9 @@ func (e *Engine) UploadFile(ctx context.Context, parentID int64, name, mimeType 
 		cleanupUploaded()
 		return nil, err
 	}
+	if uploadKey != "" {
+		_ = e.store.ClearUploadCheckpoint(uploadKey)
+	}
 	if len(replaced) > 0 {
 		go e.deleteBestEffort(replaced)
 	}
@@ -380,6 +426,41 @@ func (e *Engine) uploadSmallPacked(
 		return nil, io.ErrUnexpectedEOF
 	}
 	return e.packer.StageSmallFile(ctx, parentID, name, mimeType, plainSize, append([]byte(nil), hdr[:]...), cipherBuf.Bytes(), packMaxBytes, idleDur)
+}
+
+func computeResumableUploadKey(parentID int64, name string, knownSize, partSize int64, rs io.ReadSeeker) (string, bool) {
+	const sampleSize int64 = 64 * 1024
+	if _, err := rs.Seek(0, io.SeekStart); err != nil {
+		return "", false
+	}
+	head := make([]byte, sampleSize)
+	hn, err := io.ReadFull(rs, head)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		_, _ = rs.Seek(0, io.SeekStart)
+		return "", false
+	}
+	tailOff := knownSize - sampleSize
+	if tailOff < 0 {
+		tailOff = 0
+	}
+	var tail []byte
+	var tn int
+	if _, err := rs.Seek(tailOff, io.SeekStart); err == nil {
+		tail = make([]byte, sampleSize)
+		tn, err = io.ReadFull(rs, tail)
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			_, _ = rs.Seek(0, io.SeekStart)
+			return "", false
+		}
+	}
+	if _, err := rs.Seek(0, io.SeekStart); err != nil {
+		return "", false
+	}
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%d|%s|%d|%d|", parentID, name, knownSize, partSize)
+	_, _ = h.Write(head[:hn])
+	_, _ = h.Write(tail[:tn])
+	return hex.EncodeToString(h.Sum(nil)), true
 }
 
 type exactReader struct {
@@ -653,7 +734,7 @@ func (fr *FileReader) recordAndPrefetch(partIdx int, part *db.FilePart, cipherOf
 	if partIdx == fr.lastPartIdx && chunkIdx == fr.lastChunkIdx {
 		return
 	}
-	if partIdx == fr.lastPartIdx && chunkIdx == fr.lastChunkIdx+1 {
+	if (partIdx == fr.lastPartIdx && chunkIdx == fr.lastChunkIdx+1) || (partIdx == fr.lastPartIdx+1 && chunkIdx == 0) {
 		fr.seqChunks++
 	} else {
 		fr.seqChunks = 0
@@ -661,25 +742,47 @@ func (fr *FileReader) recordAndPrefetch(partIdx int, part *db.FilePart, cipherOf
 	fr.lastPartIdx = partIdx
 	fr.lastChunkIdx = chunkIdx
 
-	// Start 4-chunk (2 MiB) async read-ahead once 3 consecutive chunks confirm sequential streaming.
-	if fr.seqChunks < 2 || fr.engine.cache.MaxBytes() < 8*tg.TGChunkSize {
+	// Start 4–8 chunk (2–4 MiB) async read-ahead once 3 consecutive chunks confirm sequential streaming,
+	// including crossing into the next 1 GB part seamlessly.
+	cacheMax := fr.engine.cache.MaxBytes()
+	if fr.seqChunks < 2 || cacheMax < 8*tg.TGChunkSize {
 		return
 	}
+	window := int64(4)
+	if cacheMax >= 16*tg.TGChunkSize {
+		window = 8
+	}
+
+	spawnPrefetch := func(p db.FilePart, idx int64) {
+		if p.TGMsgID <= 0 || p.CipherSize <= 0 || fr.engine.cache.HasOrInflight(p.TGMsgID, idx) {
+			return
+		}
+		fr.prefetchWg.Add(1)
+		go func(pc db.FilePart, ci int64) {
+			defer fr.prefetchWg.Done()
+			_, _ = fr.engine.fetchPartChunk(fr.prefetchCtx, &pc, ci)
+		}(p, idx)
+	}
+
 	maxChunk := (part.PackOffset + part.CipherSize - 1) / tg.TGChunkSize
-	for ahead := int64(1); ahead <= 4; ahead++ {
+	remaining := window
+	for ahead := int64(1); ahead <= window; ahead++ {
 		nextIdx := chunkIdx + ahead
 		if nextIdx > maxChunk {
 			break
 		}
-		if fr.engine.cache.HasOrInflight(part.TGMsgID, nextIdx) {
-			continue
+		spawnPrefetch(*part, nextIdx)
+		remaining--
+	}
+	if remaining > 0 && partIdx+1 < len(fr.parts) {
+		nextPart := fr.parts[partIdx+1]
+		if nextPart.TGMsgID > 0 && nextPart.CipherSize > 0 {
+			nextStart := nextPart.PackOffset / tg.TGChunkSize
+			nextMax := (nextPart.PackOffset + nextPart.CipherSize - 1) / tg.TGChunkSize
+			for i := int64(0); i < remaining && nextStart+i <= nextMax; i++ {
+				spawnPrefetch(nextPart, nextStart+i)
+			}
 		}
-		partCopy := *part
-		fr.prefetchWg.Add(1)
-		go func(p db.FilePart, idx int64) {
-			defer fr.prefetchWg.Done()
-			_, _ = fr.engine.fetchPartChunk(fr.prefetchCtx, &p, idx)
-		}(partCopy, nextIdx)
 	}
 }
 
@@ -776,13 +879,24 @@ func (e *Engine) BackupDBToTelegram(ctx context.Context) (*tg.UploadedDoc, error
 	_ = e.store.RecordBackup(doc.MsgID, time.Now().Unix())
 	e.MirrorMsgAsync(doc.MsgID, true)
 
-	if docs, err := e.tg.ListChannelDocs(ctx, DBBackupPrefix, 50); err == nil && len(docs) > DBBackupKeepCount {
+	// Keep only the latest DB backup on Telegram: delete any older .tmdb backups once the new upload succeeds.
+	if docs, err := e.tg.ListChannelDocs(ctx, DBBackupPrefix, 50); err == nil {
 		sort.Slice(docs, func(i, j int) bool { return docs[i].MsgID > docs[j].MsgID })
 		var oldIDs []int
-		for _, d := range docs[DBBackupKeepCount:] {
+		kept := 1 // count newly uploaded doc even if Telegram search index lags briefly
+		for _, d := range docs {
+			if d.MsgID == doc.MsgID {
+				continue
+			}
+			if kept < DBBackupKeepCount {
+				kept++
+				continue
+			}
 			oldIDs = append(oldIDs, d.MsgID)
 		}
-		_ = e.tg.DeleteMessages(ctx, oldIDs)
+		if len(oldIDs) > 0 {
+			_ = e.tg.DeleteMessages(ctx, oldIDs)
+		}
 	}
 	return doc, nil
 }

@@ -87,14 +87,24 @@ func (e *Engine) MirrorMsg(ctx context.Context, primaryMsgID int, isDBBackup boo
 				firstErr = err
 			}
 		} else {
-			// Prune old .tmdb backups on the backup account's own channel so only the latest snapshots remain.
-			if docs, err := backend.ListChannelDocs(ctx, DBBackupPrefix, 30); err == nil && len(docs) > DBBackupKeepCount {
+			// Keep only the latest DB backup on the backup account's own channel too.
+			if docs, err := backend.ListChannelDocs(ctx, DBBackupPrefix, 30); err == nil {
 				sort.Slice(docs, func(i, j int) bool { return docs[i].MsgID > docs[j].MsgID })
 				var oldIDs []int
-				for _, d := range docs[DBBackupKeepCount:] {
+				kept := 1
+				for _, d := range docs {
+					if d.MsgID == repDoc.MsgID {
+						continue
+					}
+					if kept < DBBackupKeepCount {
+						kept++
+						continue
+					}
 					oldIDs = append(oldIDs, d.MsgID)
 				}
-				_ = backend.DeleteMessages(ctx, oldIDs)
+				if len(oldIDs) > 0 {
+					_ = backend.DeleteMessages(ctx, oldIDs)
+				}
 			}
 		}
 	}
