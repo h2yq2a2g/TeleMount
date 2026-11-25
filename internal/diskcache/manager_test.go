@@ -1349,4 +1349,71 @@ func TestReadStreamReusesSingleBackendReaderAcrossSeeksAndETagInvalidation(t *te
 	}
 }
 
+func TestReadStreamAutoRetiresIdleTransferAndFlushReleasesImmediately(t *testing.T) {
+	store, eng, mtg := setupTestEngine(t)
+	ctx := context.Background()
+
+	gamesDir, err := store.MkdirAll("/Games")
+	if err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	payload := make([]byte, 5<<20)
+	for i := range payload {
+		payload[i] = byte((i*13 + 7) % 251)
+	}
+	if _, err := eng.UploadFile(ctx, gamesDir.ID, "pack.zip", "application/zip", bytes.NewReader(payload), int64(len(payload))); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+	if err := eng.Packer().FlushNow(ctx); err != nil {
+		t.Fatalf("FlushNow: %v", err)
+	}
+
+	dir := t.TempDir()
+	mgr, err := Open(filepath.Join(dir, "cache"), filepath.Join(dir, "desktop_cache.db"), DefaultMaxBytes, store, eng)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer mgr.Close()
+
+	rs := mgr.OpenReadStream("/Games/pack.zip")
+	rs.idleTimeout = 60 * time.Millisecond
+	defer rs.Close()
+
+	// Partial extraction from .zip starts an active download transfer.
+	part := make([]byte, 4096)
+	if n, err := rs.ReadAt(ctx, part, 0); err != nil || n != len(part) || !bytes.Equal(part, payload[:4096]) {
+		t.Fatalf("first ReadAt = (%d, %v)", n, err)
+	}
+	if got := len(mtg.Tracker().Snapshot().ActiveTransfers); got != 1 {
+		t.Fatalf("expected 1 active transfer during read, got %d", got)
+	}
+
+	// Once extraction pauses/finishes while the archive window stays open, idle timeout must clear ActiveTransfers.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(mtg.Tracker().Snapshot().ActiveTransfers) == 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if got := len(mtg.Tracker().Snapshot().ActiveTransfers); got != 0 {
+		t.Fatalf("expected idle ReadStream to auto-retire transfer, still have %d active", got)
+	}
+
+	// Subsequent read on the still-open handle must transparently re-open and serve exact bytes.
+	tailOff := int64(len(payload) - 4096)
+	if n, err := rs.ReadAt(ctx, part, tailOff); err != nil || n != len(part) || !bytes.Equal(part, payload[tailOff:]) {
+		t.Fatalf("re-open ReadAt = (%d, %v)", n, err)
+	}
+	if got := len(mtg.Tracker().Snapshot().ActiveTransfers); got != 1 {
+		t.Fatalf("expected 1 active transfer after re-open, got %d", got)
+	}
+
+	// ReleaseIdle (called on WinFsp Flush/CloseHandle) must clear ActiveTransfers immediately.
+	rs.ReleaseIdle()
+	if got := len(mtg.Tracker().Snapshot().ActiveTransfers); got != 0 {
+		t.Fatalf("expected 0 active transfers after ReleaseIdle, got %d", got)
+	}
+}
+
 

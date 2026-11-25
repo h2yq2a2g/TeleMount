@@ -591,25 +591,44 @@ func (m *Manager) readCachedAfterFetch(ctx context.Context, normPath string, buf
 	return n, err
 }
 
+const defaultStreamIdleTimeout = 4 * time.Second
+
 // ReadStream holds a reusable range-capable remote reader for one open VFS file handle,
 // preserving FileReader block caching, transfer reporting, and sequential read-ahead across Reads.
+// Idle remote readers auto-close after idleTimeout (and on Flush/ReleaseIdle) so finished partial
+// reads (e.g. extracting one entry from an open .zip) do not linger in Active Transfers.
 type ReadStream struct {
-	mgr    *Manager
-	path   string
-	mu     sync.Mutex
-	rc     io.ReadCloser
-	ra     io.ReaderAt
-	size   int64
-	etag   string
-	closed bool
+	mgr         *Manager
+	path        string
+	idleTimeout time.Duration
+	mu          sync.Mutex
+	rc          io.ReadCloser
+	ra          io.ReaderAt
+	size        int64
+	etag        string
+	idleTimer   *time.Timer
+	idleGen     uint64
+	closed      bool
 }
 
 // OpenReadStream returns a lazy handle-scoped reader for VFS streaming reads.
 func (m *Manager) OpenReadStream(virtualPath string) *ReadStream {
 	return &ReadStream{
-		mgr:  m,
-		path: NormalizePath(virtualPath),
+		mgr:         m,
+		path:        NormalizePath(virtualPath),
+		idleTimeout: defaultStreamIdleTimeout,
 	}
+}
+
+// ReleaseIdle immediately closes any open remote reader (e.g. on WinFsp Flush/CloseHandle)
+// while keeping the handle usable if another Read arrives before Release.
+func (rs *ReadStream) ReleaseIdle() {
+	if rs == nil {
+		return
+	}
+	rs.mu.Lock()
+	rs.resetLocked()
+	rs.mu.Unlock()
 }
 
 func (rs *ReadStream) Close() error {
@@ -618,9 +637,16 @@ func (rs *ReadStream) Close() error {
 	}
 	rs.mu.Lock()
 	rs.closed = true
+	rs.idleGen++
+	if rs.idleTimer != nil {
+		rs.idleTimer.Stop()
+		rs.idleTimer = nil
+	}
 	rc := rs.rc
 	rs.rc = nil
 	rs.ra = nil
+	rs.size = 0
+	rs.etag = ""
 	rs.mu.Unlock()
 	if rc != nil {
 		return rc.Close()
@@ -629,6 +655,11 @@ func (rs *ReadStream) Close() error {
 }
 
 func (rs *ReadStream) resetLocked() {
+	rs.idleGen++
+	if rs.idleTimer != nil {
+		rs.idleTimer.Stop()
+		rs.idleTimer = nil
+	}
 	if rs.rc != nil {
 		_ = rs.rc.Close()
 		rs.rc = nil
@@ -636,6 +667,24 @@ func (rs *ReadStream) resetLocked() {
 		rs.size = 0
 		rs.etag = ""
 	}
+}
+
+func (rs *ReadStream) armIdleLocked() {
+	if rs.closed || rs.rc == nil || rs.idleTimeout <= 0 {
+		return
+	}
+	rs.idleGen++
+	gen := rs.idleGen
+	if rs.idleTimer != nil {
+		rs.idleTimer.Stop()
+	}
+	rs.idleTimer = time.AfterFunc(rs.idleTimeout, func() {
+		rs.mu.Lock()
+		if !rs.closed && rs.idleGen == gen {
+			rs.resetLocked()
+		}
+		rs.mu.Unlock()
+	})
 }
 
 func (rs *ReadStream) ReadAt(ctx context.Context, buf []byte, offset int64) (int, error) {
@@ -667,6 +716,12 @@ func (rs *ReadStream) ReadAt(ctx context.Context, buf []byte, offset int64) (int
 	if rs.closed {
 		return 0, os.ErrClosed
 	}
+	// Cancel any pending idle close before performing network I/O.
+	rs.idleGen++
+	if rs.idleTimer != nil {
+		rs.idleTimer.Stop()
+		rs.idleTimer = nil
+	}
 	if rs.rc == nil || rs.etag != rn.ETag || rs.size != rn.Size {
 		rs.resetLocked()
 		rc, remoteSize, _, oerr := rs.mgr.backend.OpenReader(ctx, rn.Path)
@@ -689,11 +744,14 @@ func (rs *ReadStream) ReadAt(ctx context.Context, buf []byte, offset int64) (int
 	}
 
 	if rs.size == 0 || offset >= rs.size {
+		rs.armIdleLocked()
 		return 0, io.EOF
 	}
 	n, rerr := readAllAt(rs.ra, rs.size, buf, offset)
 	if rerr != nil && !errors.Is(rerr, io.EOF) {
 		rs.resetLocked()
+	} else {
+		rs.armIdleLocked()
 	}
 	return n, rerr
 }

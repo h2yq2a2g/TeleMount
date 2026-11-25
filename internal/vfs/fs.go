@@ -850,8 +850,18 @@ func (f *TeleFS) Flush(_ string, fh uint64) int {
 		return 0
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	return f.flushHandleLocked(h)
+	rc := f.flushHandleLocked(h)
+	var rs *diskcache.ReadStream
+	if !h.dirty {
+		rs = h.readStream
+	}
+	h.mu.Unlock()
+	// WinFsp calls Flush on CloseHandle before Windows Cache Manager eventually fires Release;
+	// release any idle streaming reader now so finished downloads clear from Active Transfers immediately.
+	if rs != nil {
+		rs.ReleaseIdle()
+	}
+	return rc
 }
 
 func (f *TeleFS) Release(_ string, fh uint64) int {
