@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -64,6 +63,8 @@ type Manager struct {
 	streamThreshold int64
 	pinnedPaths     []string
 	lastAccessNS    atomic.Int64
+	lastTouchedPath string
+	lastTouchedAt   time.Time
 
 	blobMu              sync.Mutex
 	activeBlobReaders   map[string]int
@@ -151,6 +152,11 @@ func OpenWithBackend(cacheDir, dbPath string, maxBytes int64, store *db.Store, b
 		if err := rows.Scan(&p); err == nil && strings.TrimSpace(p) != "" {
 			m.pinnedPaths = append(m.pinnedPaths, NormalizePath(p))
 		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		_ = conn.Close()
+		return nil, err
 	}
 	_ = rows.Close()
 
@@ -433,6 +439,20 @@ func (m *Manager) shouldStreamUncached(size int64, isPinned bool, maxBytes int64
 	return !isPinned && maxBytes >= 0 && size > maxBytes
 }
 
+// touchAccessLocked updates LRU recency in SQLite, skipping redundant writes when
+// repeated sequential reads hit the same file within 30s (preserving exact cross-file LRU order).
+func (m *Manager) touchAccessLocked(pathLower string) int64 {
+	now := time.Now()
+	if pathLower == m.lastTouchedPath && now.Sub(m.lastTouchedAt) < 30*time.Second {
+		return m.lastAccessNS.Load()
+	}
+	accessNS := m.nextAccessNS()
+	_, _ = m.db.Exec(`UPDATE cache_entries SET last_accessed_ns = ? WHERE path_lower = ?`, accessNS, pathLower)
+	m.lastTouchedPath = pathLower
+	m.lastTouchedAt = now
+	return accessNS
+}
+
 func (m *Manager) resolveReadLocal(normPath string, buf []byte, offset int64) (int, bool, *RemoteNode, bool, int64, error) {
 	if offset < 0 {
 		return 0, true, nil, false, 0, fmt.Errorf("negative offset: %d", offset)
@@ -472,8 +492,7 @@ func (m *Manager) resolveReadLocal(normPath string, buf []byte, offset int64) (i
 					blobKey = ce.BlobKey
 				}
 			}
-			accessNS := m.nextAccessNS()
-			_, _ = m.db.Exec(`UPDATE cache_entries SET last_accessed_ns = ? WHERE path_lower = ?`, accessNS, pathLower)
+			m.touchAccessLocked(pathLower)
 			size := ov.Size
 			m.stateMu.Unlock()
 
@@ -523,8 +542,7 @@ func (m *Manager) resolveReadLocal(normPath string, buf []byte, offset int64) (i
 			}
 		}
 		if !stale && m.blobValid(ce.BlobKey, ce.Size) {
-			accessNS := m.nextAccessNS()
-			_, _ = m.db.Exec(`UPDATE cache_entries SET last_accessed_ns = ? WHERE path_lower = ?`, accessNS, pathLower)
+			m.touchAccessLocked(pathLower)
 			size := ce.Size
 			blobKey := ce.BlobKey
 			m.stateMu.Unlock()
@@ -890,9 +908,7 @@ func (m *Manager) downloadAndCommitClean(ctx context.Context, normPath string) (
 	}
 	if ce, ceOk, _ := m.getCacheEntry(pathLower); ceOk && !ce.Dirty {
 		if ce.RemoteETag == rn.ETag && ce.Size == rn.Size && (ce.RemoteNodeID == 0 || rn.ID == 0 || ce.RemoteNodeID == rn.ID) && m.blobValid(ce.BlobKey, ce.Size) {
-			accessNS := m.nextAccessNS()
-			_, _ = m.db.Exec(`UPDATE cache_entries SET last_accessed_ns = ? WHERE path_lower = ?`, accessNS, pathLower)
-			ce.LastAccessedNS = accessNS
+			ce.LastAccessedNS = m.touchAccessLocked(pathLower)
 			m.stateMu.Unlock()
 			return ce, nil
 		}
@@ -962,83 +978,93 @@ func (m *Manager) downloadAndCommitClean(ctx context.Context, normPath string) (
 		finalSize = 0
 	}
 
-	m.stateMu.Lock()
-	// Check if a local dirty write happened while we were downloading; never overwrite dirty entry!
-	if ov, ok, _ := m.getOverlayRow(pathLower); ok && ov.Dirty {
-		if ce, ceOk, _ := m.getCacheEntry(pathLower); ceOk {
-			m.stateMu.Unlock()
-			if blobKey != "" {
-				removeWithRetry(m.blobPath(blobKey))
+	var (
+		ce             *cacheEntry
+		oldBlobKey     string
+		discardNewBlob bool
+		dirtyResult    *cacheEntry
+	)
+	commitErr := func() error {
+		m.stateMu.Lock()
+		defer m.stateMu.Unlock()
+
+		// Check if a local dirty write happened while we were downloading; never overwrite dirty entry!
+		if ov, ok, _ := m.getOverlayRow(pathLower); ok && ov.Dirty {
+			if existingCE, ceOk, _ := m.getCacheEntry(pathLower); ceOk {
+				dirtyResult = existingCE
+				discardNewBlob = true
+				return nil
 			}
-			return ce, nil
 		}
-	}
 
-	var oldBlobKey string
-	_ = m.db.QueryRow(`SELECT blob_key FROM cache_entries WHERE path_lower = ?`, pathLower).Scan(&oldBlobKey)
+		_ = m.db.QueryRow(`SELECT blob_key FROM cache_entries WHERE path_lower = ?`, pathLower).Scan(&oldBlobKey)
 
-	nowNS := time.Now().UnixNano()
-	accessNS := m.nextAccessNS()
-	pinned := m.isPinnedLocked(canonicalPath)
-	pinnedInt := boolToInt(pinned)
+		nowNS := time.Now().UnixNano()
+		accessNS := m.nextAccessNS()
+		pinned := m.isPinnedLocked(canonicalPath)
+		pinnedInt := boolToInt(pinned)
 
-	tx, err := m.db.Begin()
-	if err != nil {
-		m.stateMu.Unlock()
-		if blobKey != "" {
-			removeWithRetry(m.blobPath(blobKey))
+		tx, err := m.db.Begin()
+		if err != nil {
+			discardNewBlob = true
+			return err
 		}
-		return nil, err
-	}
-	defer tx.Rollback()
+		defer tx.Rollback()
 
-	if _, err := tx.Exec(`
-		INSERT INTO cache_entries (path_lower, path, blob_key, size, mtime, last_accessed_ns, dirty, pinned, remote_node_id, remote_etag, last_op_id, created_at_ns, updated_at_ns)
-		VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?, ?)
-		ON CONFLICT(path_lower) DO UPDATE SET
-			path=excluded.path, blob_key=excluded.blob_key, size=excluded.size, mtime=excluded.mtime,
-			last_accessed_ns=excluded.last_accessed_ns, dirty=0, pinned=excluded.pinned,
-			remote_node_id=excluded.remote_node_id, remote_etag=excluded.remote_etag, last_op_id=0, updated_at_ns=excluded.updated_at_ns
-	`, pathLower, canonicalPath, blobKey, finalSize, rn.Mtime, accessNS, pinnedInt, rn.ID, remoteETag, nowNS, nowNS); err != nil {
-		m.stateMu.Unlock()
-		if blobKey != "" {
-			removeWithRetry(m.blobPath(blobKey))
+		if _, err := tx.Exec(`
+			INSERT INTO cache_entries (path_lower, path, blob_key, size, mtime, last_accessed_ns, dirty, pinned, remote_node_id, remote_etag, last_op_id, created_at_ns, updated_at_ns)
+			VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?, ?)
+			ON CONFLICT(path_lower) DO UPDATE SET
+				path=excluded.path, blob_key=excluded.blob_key, size=excluded.size, mtime=excluded.mtime,
+				last_accessed_ns=excluded.last_accessed_ns, dirty=0, pinned=excluded.pinned,
+				remote_node_id=excluded.remote_node_id, remote_etag=excluded.remote_etag, last_op_id=0, updated_at_ns=excluded.updated_at_ns
+		`, pathLower, canonicalPath, blobKey, finalSize, rn.Mtime, accessNS, pinnedInt, rn.ID, remoteETag, nowNS, nowNS); err != nil {
+			discardNewBlob = true
+			return err
 		}
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		m.stateMu.Unlock()
-		if blobKey != "" {
-			removeWithRetry(m.blobPath(blobKey))
+		if err := tx.Commit(); err != nil {
+			discardNewBlob = true
+			return err
 		}
-		return nil, err
-	}
+		m.lastTouchedPath = pathLower
+		m.lastTouchedAt = time.Now()
 
-	if err := m.evictToBudgetLocked(); err != nil {
-		m.stateMu.Unlock()
-		return nil, err
+		if err := m.evictToBudgetLocked(); err != nil {
+			return err
+		}
+		var gerr error
+		ce, _, gerr = m.getCacheEntry(pathLower)
+		if ce == nil {
+			ce = &cacheEntry{
+				Path:           canonicalPath,
+				PathLower:      pathLower,
+				BlobKey:        blobKey,
+				Size:           finalSize,
+				Mtime:          rn.Mtime,
+				LastAccessedNS: accessNS,
+				Pinned:         pinned,
+				RemoteNodeID:   rn.ID,
+				RemoteETag:     remoteETag,
+			}
+		}
+		return gerr
+	}()
+
+	if discardNewBlob && blobKey != "" {
+		removeWithRetry(m.blobPath(blobKey))
 	}
-	ce, _, err := m.getCacheEntry(pathLower)
-	m.stateMu.Unlock()
+	if dirtyResult != nil {
+		return dirtyResult, nil
+	}
+	if commitErr != nil {
+		return nil, commitErr
+	}
 
 	if oldBlobKey != "" && oldBlobKey != blobKey {
 		m.scheduleBlobDeletes([]string{oldBlobKey})
 	}
 	m.notifyChange(canonicalPath)
-	if ce == nil {
-		ce = &cacheEntry{
-			Path:           canonicalPath,
-			PathLower:      pathLower,
-			BlobKey:        blobKey,
-			Size:           finalSize,
-			Mtime:          rn.Mtime,
-			LastAccessedNS: accessNS,
-			Pinned:         pinned,
-			RemoteNodeID:   rn.ID,
-			RemoteETag:     remoteETag,
-		}
-	}
-	return ce, err
+	return ce, nil
 }
 
 // PinSync pre-fetches a pinned file or directory subtree into the disk cache while online.
@@ -1095,6 +1121,3 @@ func (m *Manager) PinSync(ctx context.Context, p string) error {
 	}
 	return nil
 }
-
-// Ensure path package is used.
-var _ = path.Clean

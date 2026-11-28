@@ -93,73 +93,71 @@ func (m *Manager) SetPinnedPaths(paths []string) error {
 		normalized = append(normalized, norm)
 	}
 
-	m.stateMu.Lock()
-	tx, err := m.db.Begin()
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	defer tx.Rollback()
+	if err := func() error {
+		m.stateMu.Lock()
+		defer m.stateMu.Unlock()
 
-	if _, err := tx.Exec(`DELETE FROM pinned_paths`); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	now := time.Now().Unix()
-	for _, p := range normalized {
-		if _, err := tx.Exec(
-			`INSERT INTO pinned_paths (path_lower, path, created_at) VALUES (?, ?, ?)`,
-			strings.ToLower(p), p, now,
-		); err != nil {
-			m.stateMu.Unlock()
+		tx, err := m.db.Begin()
+		if err != nil {
 			return err
 		}
-	}
+		defer tx.Rollback()
 
-	rows, err := tx.Query(`SELECT path_lower, path, pinned FROM cache_entries`)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	type pinUpdate struct {
-		pathLower string
-		pinned    int
-	}
-	var updates []pinUpdate
-	for rows.Next() {
-		var pLower, p string
-		var curPinned int
-		if err := rows.Scan(&pLower, &p, &curPinned); err != nil {
+		if _, err := tx.Exec(`DELETE FROM pinned_paths`); err != nil {
+			return err
+		}
+		now := time.Now().Unix()
+		for _, p := range normalized {
+			if _, err := tx.Exec(
+				`INSERT INTO pinned_paths (path_lower, path, created_at) VALUES (?, ?, ?)`,
+				strings.ToLower(p), p, now,
+			); err != nil {
+				return err
+			}
+		}
+
+		rows, err := tx.Query(`SELECT path_lower, path, pinned FROM cache_entries`)
+		if err != nil {
+			return err
+		}
+		type pinUpdate struct {
+			pathLower string
+			pinned    int
+		}
+		var updates []pinUpdate
+		for rows.Next() {
+			var pLower, p string
+			var curPinned int
+			if err := rows.Scan(&pLower, &p, &curPinned); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			want := boolToInt(IsPathPinned(normalized, p))
+			if want != curPinned {
+				updates = append(updates, pinUpdate{pathLower: pLower, pinned: want})
+			}
+		}
+		if err := rows.Err(); err != nil {
 			_ = rows.Close()
-			m.stateMu.Unlock()
 			return err
 		}
-		want := boolToInt(IsPathPinned(normalized, p))
-		if want != curPinned {
-			updates = append(updates, pinUpdate{pathLower: pLower, pinned: want})
-		}
-	}
-	if err := rows.Close(); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	for _, u := range updates {
-		if _, err := tx.Exec(`UPDATE cache_entries SET pinned = ? WHERE path_lower = ?`, u.pinned, u.pathLower); err != nil {
-			m.stateMu.Unlock()
+		if err := rows.Close(); err != nil {
 			return err
 		}
-	}
+		for _, u := range updates {
+			if _, err := tx.Exec(`UPDATE cache_entries SET pinned = ? WHERE path_lower = ?`, u.pinned, u.pathLower); err != nil {
+				return err
+			}
+		}
 
-	if err := tx.Commit(); err != nil {
-		m.stateMu.Unlock()
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+
+		m.pinnedPaths = normalized
+		return m.evictToBudgetLocked()
+	}(); err != nil {
 		return err
-	}
-
-	m.pinnedPaths = normalized
-	evErr := m.evictToBudgetLocked()
-	m.stateMu.Unlock()
-	if evErr != nil {
-		return evErr
 	}
 	m.notifyChange("/")
 	return nil
@@ -250,51 +248,56 @@ func (m *Manager) evictToBudgetLocked() error {
 
 // ClearUnpinned removes all clean, unpinned entries from the disk cache while preserving pinned and dirty entries.
 func (m *Manager) ClearUnpinned() error {
-	m.stateMu.Lock()
-	rows, err := m.db.Query(`SELECT path_lower, blob_key FROM cache_entries WHERE dirty = 0 AND pinned = 0`)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
 	var keys []string
-	var paths []string
-	for rows.Next() {
-		var pLower, bKey string
-		if err := rows.Scan(&pLower, &bKey); err != nil {
-			_ = rows.Close()
-			m.stateMu.Unlock()
+	var hadEntries bool
+	err := func() error {
+		m.stateMu.Lock()
+		defer m.stateMu.Unlock()
+
+		rows, err := m.db.Query(`SELECT path_lower, blob_key FROM cache_entries WHERE dirty = 0 AND pinned = 0`)
+		if err != nil {
 			return err
 		}
-		paths = append(paths, pLower)
-		if bKey != "" {
-			keys = append(keys, bKey)
+		for rows.Next() {
+			var pLower, bKey string
+			if err := rows.Scan(&pLower, &bKey); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			hadEntries = true
+			if bKey != "" {
+				keys = append(keys, bKey)
+			}
 		}
-	}
-	if err := rows.Close(); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	if len(paths) == 0 {
-		m.stateMu.Unlock()
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if !hadEntries {
+			return nil
+		}
+
+		tx, err := m.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		if _, err := tx.Exec(`DELETE FROM cache_entries WHERE dirty = 0 AND pinned = 0`); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		m.lastTouchedPath = ""
 		return nil
-	}
-
-	tx, err := m.db.Begin()
-	if err != nil {
-		m.stateMu.Unlock()
+	}()
+	if err != nil || !hadEntries {
 		return err
 	}
-	defer tx.Rollback()
-
-	if _, err := tx.Exec(`DELETE FROM cache_entries WHERE dirty = 0 AND pinned = 0`); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	m.stateMu.Unlock()
 	m.scheduleBlobDeletes(keys)
 	m.notifyChange("/")
 	return nil
@@ -436,75 +439,83 @@ func (m *Manager) EvictPath(virtualPath string) (freedBytes int64, evictedFiles 
 	norm := NormalizePath(virtualPath)
 	pathLower := strings.ToLower(norm)
 
-	m.stateMu.Lock()
-	var rows *sql.Rows
-	if norm == "/" {
-		rows, err = m.db.Query(`SELECT path_lower, blob_key, size, dirty FROM cache_entries`)
-	} else {
-		pStart, pEnd := subtreeBounds(pathLower)
-		rows, err = m.db.Query(
-			`SELECT path_lower, blob_key, size, dirty FROM cache_entries WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
-			pathLower, pStart, pEnd,
-		)
-	}
-	if err != nil {
-		m.stateMu.Unlock()
-		return 0, 0, 0, err
-	}
-
-	var cleanPaths []string
 	var blobKeys []string
-	for rows.Next() {
-		var pLower, bKey string
-		var sz int64
-		var dirtyInt int
-		if scanErr := rows.Scan(&pLower, &bKey, &sz, &dirtyInt); scanErr != nil {
+	err = func() error {
+		m.stateMu.Lock()
+		defer m.stateMu.Unlock()
+
+		var rows *sql.Rows
+		var qerr error
+		if norm == "/" {
+			rows, qerr = m.db.Query(`SELECT path_lower, blob_key, size, dirty FROM cache_entries`)
+		} else {
+			pStart, pEnd := subtreeBounds(pathLower)
+			rows, qerr = m.db.Query(
+				`SELECT path_lower, blob_key, size, dirty FROM cache_entries WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
+				pathLower, pStart, pEnd,
+			)
+		}
+		if qerr != nil {
+			return qerr
+		}
+
+		var cleanPaths []string
+		for rows.Next() {
+			var pLower, bKey string
+			var sz int64
+			var dirtyInt int
+			if scanErr := rows.Scan(&pLower, &bKey, &sz, &dirtyInt); scanErr != nil {
+				_ = rows.Close()
+				return scanErr
+			}
+			if dirtyInt != 0 {
+				skippedDirty++
+				continue
+			}
+			cleanPaths = append(cleanPaths, pLower)
+			freedBytes += sz
+			if bKey != "" {
+				blobKeys = append(blobKeys, bKey)
+			}
+		}
+		if rerr := rows.Err(); rerr != nil {
 			_ = rows.Close()
-			m.stateMu.Unlock()
-			return 0, 0, 0, scanErr
+			return rerr
 		}
-		if dirtyInt != 0 {
-			skippedDirty++
-			continue
+		if closeErr := rows.Close(); closeErr != nil {
+			return closeErr
 		}
-		cleanPaths = append(cleanPaths, pLower)
-		freedBytes += sz
-		if bKey != "" {
-			blobKeys = append(blobKeys, bKey)
+		if len(cleanPaths) == 0 {
+			return nil
 		}
-	}
-	if closeErr := rows.Close(); closeErr != nil {
-		m.stateMu.Unlock()
-		return 0, 0, 0, closeErr
-	}
-	if len(cleanPaths) == 0 {
-		m.stateMu.Unlock()
-		return 0, 0, skippedDirty, nil
-	}
 
-	tx, err := m.db.Begin()
+		tx, berr := m.db.Begin()
+		if berr != nil {
+			return berr
+		}
+		defer tx.Rollback()
+
+		for _, pLower := range cleanPaths {
+			res, execErr := tx.Exec(`DELETE FROM cache_entries WHERE path_lower = ? AND dirty = 0`, pLower)
+			if execErr != nil {
+				return execErr
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				evictedFiles += int(n)
+			}
+		}
+		if cerr := tx.Commit(); cerr != nil {
+			return cerr
+		}
+		m.lastTouchedPath = ""
+		return nil
+	}()
 	if err != nil {
-		m.stateMu.Unlock()
 		return 0, 0, skippedDirty, err
 	}
-	defer tx.Rollback()
-
-	for _, pLower := range cleanPaths {
-		res, execErr := tx.Exec(`DELETE FROM cache_entries WHERE path_lower = ? AND dirty = 0`, pLower)
-		if execErr != nil {
-			m.stateMu.Unlock()
-			return 0, 0, skippedDirty, execErr
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			evictedFiles += int(n)
-		}
+	if len(blobKeys) > 0 {
+		m.scheduleBlobDeletes(blobKeys)
 	}
-	if err := tx.Commit(); err != nil {
-		m.stateMu.Unlock()
-		return 0, 0, skippedDirty, err
-	}
-	m.stateMu.Unlock()
-	m.scheduleBlobDeletes(blobKeys)
 	if evictedFiles > 0 {
 		m.notifyChange(norm)
 	}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"os"
 	"path"
@@ -26,7 +27,7 @@ import (
 const (
 	DBBackupPrefix       = "telemount-db-backup-"
 	legacyDBBackupPrefix = "teledrive-db-backup-"
-	DBBackupKeepCount    = 1
+	DBBackupKeepCount    = 5
 )
 
 var (
@@ -44,6 +45,14 @@ type Engine struct {
 
 	backupMu sync.Mutex
 	syncMu   sync.Mutex
+
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	bgWg     sync.WaitGroup
+
+	errMu         sync.RWMutex
+	lastBgError   string
+	lastBgErrorAt int64
 }
 
 func NewEngine(store *db.Store, st *state.Manager, tgBackend tg.Backend, tmpDir string) *Engine {
@@ -54,16 +63,61 @@ func NewEngine(store *db.Store, st *state.Manager, tgBackend tg.Backend, tmpDir 
 	if tmpDir == "" {
 		tmpDir = os.TempDir()
 	}
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	e := &Engine{
-		store:  store,
-		state:  st,
-		tg:     tgBackend,
-		pool:   tg.NewPool(st.DataDir()),
-		cache:  NewChunkCache(int64(cacheMB) * 1024 * 1024),
-		tmpDir: tmpDir,
+		store:    store,
+		state:    st,
+		tg:       tgBackend,
+		pool:     tg.NewPool(st.DataDir()),
+		cache:    NewChunkCache(int64(cacheMB) * 1024 * 1024),
+		tmpDir:   tmpDir,
+		bgCtx:    bgCtx,
+		bgCancel: bgCancel,
 	}
 	e.packer = newPacker(e)
 	return e
+}
+
+// Close stops background tasks and packer timers cleanly.
+func (e *Engine) Close() {
+	e.packer.Close()
+	e.bgCancel()
+	e.bgWg.Wait()
+}
+
+func (e *Engine) spawnBg(fn func(ctx context.Context)) {
+	if e.bgCtx.Err() != nil {
+		return
+	}
+	e.bgWg.Add(1)
+	go func() {
+		defer e.bgWg.Done()
+		fn(e.bgCtx)
+	}()
+}
+
+func (e *Engine) recordBgError(op string, err error) {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return
+	}
+	slog.Warn("storage background operation failed", "op", op, "err", err)
+	e.errMu.Lock()
+	e.lastBgError = fmt.Sprintf("%s: %v", op, err)
+	e.lastBgErrorAt = time.Now().Unix()
+	e.errMu.Unlock()
+}
+
+func (e *Engine) clearBgError() {
+	e.errMu.Lock()
+	e.lastBgError = ""
+	e.errMu.Unlock()
+}
+
+// LastBackgroundError returns the most recent background failure message and unix timestamp.
+func (e *Engine) LastBackgroundError() (string, int64) {
+	e.errMu.RLock()
+	defer e.errMu.RUnlock()
+	return e.lastBgError, e.lastBgErrorAt
 }
 
 func (e *Engine) Store() *db.Store     { return e.store }
@@ -88,7 +142,13 @@ func (e *Engine) ApplySettings(s db.Settings) error {
 
 // StartBackgroundTasks periodically flushes pending Telegram deletes and runs automatic encrypted DB backups.
 func (e *Engine) StartBackgroundTasks(ctx context.Context) {
+	if unflushed, err := e.store.CountUnflushedParts(); err == nil && unflushed > 0 {
+		slog.Warn("detected unflushed file parts with tg_msg_id=0 from previous crash or dirty shutdown", "count", unflushed)
+	}
+
+	e.bgWg.Add(1)
 	go func() {
+		defer e.bgWg.Done()
 		delTicker := time.NewTicker(2 * time.Minute)
 		bakTicker := time.NewTicker(1 * time.Minute)
 		syncTicker := time.NewTicker(5 * time.Minute)
@@ -100,17 +160,27 @@ func (e *Engine) StartBackgroundTasks(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
+			case <-e.bgCtx.Done():
+				return
 			case <-delTicker.C:
 				if e.IsReady() {
-					_ = e.FlushPendingDeletes(ctx)
+					if err := e.FlushPendingDeletes(ctx); err != nil {
+						e.recordBgError("flush_pending_deletes", err)
+					}
 					e.FlushPendingReplicaDeletes(ctx)
-					if stale, err := e.store.PruneStaleUploadCheckpoints(7 * 24 * time.Hour); err == nil && len(stale) > 0 {
-						go e.deleteBestEffort(stale)
+					if stale, err := e.store.PruneStaleUploadCheckpoints(7 * 24 * time.Hour); err != nil {
+						e.recordBgError("prune_upload_checkpoints", err)
+					} else if len(stale) > 0 {
+						e.deleteBestEffortAsync(stale)
 					}
 				}
 			case <-syncTicker.C:
 				if e.IsReady() && len(e.state.BackupAccounts()) > 0 {
-					_, _ = e.SyncAllReplicas(ctx, "")
+					if rep, err := e.SyncAllReplicas(ctx, ""); err != nil {
+						e.recordBgError("sync_replicas", err)
+					} else if rep != nil && len(rep.Errors) > 0 {
+						e.recordBgError("sync_replicas", errors.New(rep.Errors[0]))
+					}
 				}
 			case <-bakTicker.C:
 				if !e.IsReady() {
@@ -125,9 +195,11 @@ func (e *Engine) StartBackgroundTasks(ctx context.Context) {
 					continue
 				}
 				if time.Since(time.Unix(settings.LastBackupAt, 0)) >= time.Duration(settings.BackupIntervalMin)*time.Minute {
-					// Flush any staged small-file pack before taking a DB backup so the backup contains real Telegram message IDs!
-					_ = e.packer.FlushNow(ctx)
-					_, _ = e.BackupDBToTelegram(ctx)
+					if _, err := e.BackupDBToTelegram(ctx); err != nil {
+						e.recordBgError("auto_db_backup", err)
+					} else {
+						e.clearBgError()
+					}
 				}
 			}
 		}
@@ -175,7 +247,7 @@ func (e *Engine) UploadFile(ctx context.Context, parentID int64, name, mimeType 
 	if knownSize == 0 {
 		node, replaced, err := e.store.UpsertFileWithParts(parentID, name, 0, mimeType, nil)
 		if err == nil && len(replaced) > 0 {
-			go e.deleteBestEffort(replaced)
+			e.deleteBestEffortAsync(replaced)
 		}
 		return node, err
 	}
@@ -192,7 +264,7 @@ func (e *Engine) UploadFile(ctx context.Context, parentID int64, name, mimeType 
 			if n == 0 {
 				node, replaced, uerr := e.store.UpsertFileWithParts(parentID, name, 0, mimeType, nil)
 				if uerr == nil && len(replaced) > 0 {
-					go e.deleteBestEffort(replaced)
+					e.deleteBestEffortAsync(replaced)
 				}
 				return node, uerr
 			}
@@ -391,7 +463,7 @@ func (e *Engine) UploadFile(ctx context.Context, parentID int64, name, mimeType 
 		_ = e.store.ClearUploadCheckpoint(uploadKey)
 	}
 	if len(replaced) > 0 {
-		go e.deleteBestEffort(replaced)
+		e.deleteBestEffortAsync(replaced)
 	}
 	for _, p := range parts {
 		if p.TGMsgID > 0 {
@@ -418,7 +490,9 @@ func (e *Engine) uploadSmallPacked(
 	}
 	cipherLen := crypto.CipherSize(plainSize)
 	var cipherBuf bytes.Buffer
-	cipherBuf.Grow(int(cipherLen))
+	if cipherLen > 0 && cipherLen <= 256*1024*1024 {
+		cipherBuf.Grow(int(cipherLen))
+	}
 	if _, err := io.Copy(&cipherBuf, encReader); err != nil {
 		return nil, err
 	}
@@ -430,36 +504,53 @@ func (e *Engine) uploadSmallPacked(
 
 func computeResumableUploadKey(parentID int64, name string, knownSize, partSize int64, rs io.ReadSeeker) (string, bool) {
 	const sampleSize int64 = 64 * 1024
-	if _, err := rs.Seek(0, io.SeekStart); err != nil {
-		return "", false
+	readSample := func(off int64) ([]byte, bool) {
+		if off < 0 {
+			off = 0
+		}
+		if _, err := rs.Seek(off, io.SeekStart); err != nil {
+			return nil, false
+		}
+		buf := make([]byte, sampleSize)
+		n, err := io.ReadFull(rs, buf)
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, false
+		}
+		return buf[:n], true
 	}
-	head := make([]byte, sampleSize)
-	hn, err := io.ReadFull(rs, head)
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+
+	head, ok := readSample(0)
+	if !ok {
 		_, _ = rs.Seek(0, io.SeekStart)
 		return "", false
 	}
-	tailOff := knownSize - sampleSize
-	if tailOff < 0 {
-		tailOff = 0
+	midOff := (knownSize / 2) - (sampleSize / 2)
+	mid, ok := readSample(midOff)
+	if !ok {
+		_, _ = rs.Seek(0, io.SeekStart)
+		return "", false
 	}
-	var tail []byte
-	var tn int
-	if _, err := rs.Seek(tailOff, io.SeekStart); err == nil {
-		tail = make([]byte, sampleSize)
-		tn, err = io.ReadFull(rs, tail)
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-			_, _ = rs.Seek(0, io.SeekStart)
-			return "", false
-		}
+	tail, ok := readSample(knownSize - sampleSize)
+	if !ok {
+		_, _ = rs.Seek(0, io.SeekStart)
+		return "", false
 	}
 	if _, err := rs.Seek(0, io.SeekStart); err != nil {
 		return "", false
 	}
+
+	var mtimeNS int64
+	if statter, ok := rs.(interface{ Stat() (os.FileInfo, error) }); ok {
+		if fi, err := statter.Stat(); err == nil && fi != nil {
+			mtimeNS = fi.ModTime().UnixNano()
+		}
+	}
+
 	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "%d|%s|%d|%d|", parentID, name, knownSize, partSize)
-	_, _ = h.Write(head[:hn])
-	_, _ = h.Write(tail[:tn])
+	_, _ = fmt.Fprintf(h, "%d|%s|%d|%d|%d|", parentID, name, knownSize, partSize, mtimeNS)
+	_, _ = h.Write(head)
+	_, _ = h.Write(mid)
+	_, _ = h.Write(tail)
 	return hex.EncodeToString(h.Sum(nil)), true
 }
 
@@ -475,12 +566,17 @@ func (er *exactReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (e *Engine) deleteBestEffort(msgIDs []int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := e.tg.DeleteMessages(ctx, msgIDs); err == nil {
-		_ = e.store.ClearPendingDeletes(msgIDs)
-	}
+func (e *Engine) deleteBestEffortAsync(msgIDs []int) {
+	ids := append([]int(nil), msgIDs...)
+	e.spawnBg(func(bgCtx context.Context) {
+		ctx, cancel := context.WithTimeout(bgCtx, 30*time.Second)
+		defer cancel()
+		if err := e.tg.DeleteMessages(ctx, ids); err == nil {
+			_ = e.store.ClearPendingDeletes(ids)
+		} else {
+			e.recordBgError("delete_messages", err)
+		}
+	})
 }
 
 func (e *Engine) FlushPendingDeletes(ctx context.Context) error {
@@ -504,7 +600,7 @@ func (e *Engine) DeletePermanent(ctx context.Context, nodeID int64) error {
 		return err
 	}
 	if len(mids) > 0 && e.tg.IsAuthorized() {
-		go e.deleteBestEffort(mids)
+		e.deleteBestEffortAsync(mids)
 	}
 	return nil
 }
@@ -515,7 +611,7 @@ func (e *Engine) EmptyTrash(ctx context.Context) error {
 		return err
 	}
 	if len(mids) > 0 && e.tg.IsAuthorized() {
-		go e.deleteBestEffort(mids)
+		e.deleteBestEffortAsync(mids)
 	}
 	return nil
 }
@@ -526,7 +622,7 @@ func (e *Engine) RenameOrMove(ctx context.Context, nodeID, newParentID int64, ne
 		return err
 	}
 	if len(replaced) > 0 && e.tg.IsAuthorized() {
-		go e.deleteBestEffort(replaced)
+		e.deleteBestEffortAsync(replaced)
 	}
 	return nil
 }
@@ -534,6 +630,7 @@ func (e *Engine) RenameOrMove(ctx context.Context, nodeID, newParentID int64, ne
 // FileReader provides O(1) random-access seekable plaintext reading across both multi-part large files
 // and packed small files (serving seamlessly from RAM if unflushed or from Telegram + ChunkCache once flushed).
 type FileReader struct {
+	mu         sync.Mutex
 	ctx        context.Context
 	engine     *Engine
 	node       *db.Node
@@ -608,20 +705,29 @@ func (e *Engine) OpenFile(ctx context.Context, node *db.Node) (*FileReader, erro
 }
 
 func (fr *FileReader) Close() error {
-	if !fr.closed {
-		fr.closed = true
-		if fr.prefetchCancel != nil {
-			fr.prefetchCancel()
-		}
-		fr.prefetchWg.Wait()
-		if fr.trID != "" {
-			fr.engine.tg.Tracker().EndTransfer(fr.trID)
-		}
+	fr.mu.Lock()
+	if fr.closed {
+		fr.mu.Unlock()
+		return nil
+	}
+	fr.closed = true
+	cancel := fr.prefetchCancel
+	trID := fr.trID
+	fr.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	fr.prefetchWg.Wait()
+	if trID != "" {
+		fr.engine.tg.Tracker().EndTransfer(trID)
 	}
 	return nil
 }
 
 func (fr *FileReader) Seek(offset int64, whence int) (int64, error) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
 	var target int64
 	switch whence {
 	case io.SeekStart:
@@ -641,12 +747,23 @@ func (fr *FileReader) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (fr *FileReader) Read(p []byte) (int, error) {
-	n, err := fr.ReadAt(p, fr.pos)
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	n, err := fr.readAtLocked(p, fr.pos)
 	fr.pos += int64(n)
 	return n, err
 }
 
 func (fr *FileReader) ReadAt(p []byte, off int64) (int, error) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	return fr.readAtLocked(p, off)
+}
+
+func (fr *FileReader) readAtLocked(p []byte, off int64) (int, error) {
+	if fr.closed {
+		return 0, os.ErrClosed
+	}
 	if off < 0 {
 		return 0, errors.New("negative offset")
 	}
@@ -681,7 +798,7 @@ func (fr *FileReader) ReadAt(p []byte, off int64) (int, error) {
 				fr.cipherScratch = make([]byte, cLen)
 			}
 			cipherBuf := fr.cipherScratch[:cLen]
-			fr.recordAndPrefetch(partIdx, part, cOff)
+			fr.recordAndPrefetchLocked(partIdx, part, cOff)
 			if err := fr.engine.readPartCipherRaw(fr.ctx, part, cOff, cipherBuf); err != nil {
 				return totalRead, err
 			}
@@ -726,8 +843,8 @@ func (fr *FileReader) findPart(off int64) int {
 	return idx
 }
 
-func (fr *FileReader) recordAndPrefetch(partIdx int, part *db.FilePart, cipherOff int64) {
-	if part.TGMsgID <= 0 || part.CipherSize <= 0 || fr.prefetchCtx.Err() != nil {
+func (fr *FileReader) recordAndPrefetchLocked(partIdx int, part *db.FilePart, cipherOff int64) {
+	if fr.closed || part.TGMsgID <= 0 || part.CipherSize <= 0 || fr.prefetchCtx.Err() != nil {
 		return
 	}
 	chunkIdx := (part.PackOffset + cipherOff) / tg.TGChunkSize
@@ -822,10 +939,6 @@ func (e *Engine) readPartCipherRaw(ctx context.Context, part *db.FilePart, ciphe
 		inChunkOff := int(pos % tg.TGChunkSize)
 
 		chunkData, err := e.fetchPartChunk(ctx, part, chunkIdx)
-		if err != nil && errors.Is(err, context.Canceled) && ctx.Err() == nil {
-			// Another reader cancelled its own prefetch for this chunk; retry once with our live ctx.
-			chunkData, err = e.fetchPartChunk(ctx, part, chunkIdx)
-		}
 		if err != nil {
 			return err
 		}
@@ -839,15 +952,78 @@ func (e *Engine) readPartCipherRaw(ctx context.Context, part *db.FilePart, ciphe
 	return nil
 }
 
+// readPartCipherRawUncached reads ciphertext without inserting into ChunkCache (used by background compaction
+// so rewriting packs does not evict hot user data from RAM cache).
+func (e *Engine) readPartCipherRawUncached(ctx context.Context, part *db.FilePart, cipherOff int64, dst []byte) error {
+	if part.PackID != "" {
+		if n, inMem := e.packer.ReadSlice(part.PackID, part.PackOffset+cipherOff, dst); inMem {
+			if n < len(dst) {
+				return io.ErrUnexpectedEOF
+			}
+			return nil
+		}
+		if part.TGMsgID == 0 {
+			freshParts, err := e.store.GetFileParts(part.NodeID)
+			if err != nil {
+				return err
+			}
+			for _, fp := range freshParts {
+				if fp.ID == part.ID || fp.PartIndex == part.PartIndex {
+					*part = fp
+					break
+				}
+			}
+			if part.TGMsgID == 0 {
+				return errors.New("staged pack data unavailable")
+			}
+		}
+	}
+
+	filled := 0
+	pos := part.PackOffset + cipherOff
+	var lastChunkIdx int64 = -1
+	var lastChunk []byte
+	for filled < len(dst) {
+		chunkIdx := pos / tg.TGChunkSize
+		inChunkOff := int(pos % tg.TGChunkSize)
+
+		var chunkData []byte
+		if chunkIdx == lastChunkIdx && lastChunk != nil {
+			chunkData = lastChunk
+		} else if cached, ok := e.cache.Get(part.TGMsgID, chunkIdx); ok {
+			chunkData = cached
+			lastChunkIdx = chunkIdx
+			lastChunk = cached
+		} else {
+			fetched, err := e.fetchChunkWithFailover(ctx, *part, chunkIdx*tg.TGChunkSize)
+			if err != nil {
+				return err
+			}
+			chunkData = fetched
+			lastChunkIdx = chunkIdx
+			lastChunk = fetched
+		}
+		if inChunkOff >= len(chunkData) {
+			return io.ErrUnexpectedEOF
+		}
+		n := copy(dst[filled:], chunkData[inChunkOff:])
+		filled += n
+		pos += int64(n)
+	}
+	return nil
+}
+
 func (e *Engine) fetchPartChunk(ctx context.Context, part *db.FilePart, chunkIdx int64) ([]byte, error) {
-	return e.cache.GetOrFetch(part.TGMsgID, chunkIdx, func() ([]byte, error) {
-		offset := chunkIdx * tg.TGChunkSize
-		return e.fetchChunkWithFailover(ctx, part, offset)
+	partCopy := *part
+	return e.cache.GetOrFetch(ctx, partCopy.TGMsgID, chunkIdx, func() ([]byte, error) {
+		fetchCtx, cancel := context.WithTimeout(e.bgCtx, 60*time.Second)
+		defer cancel()
+		return e.fetchChunkWithFailover(fetchCtx, partCopy, chunkIdx*tg.TGChunkSize)
 	})
 }
 
 // BackupDBToTelegram flushes any open RAM Pack first so the snapshot contains real Telegram message IDs,
-// then gzips & encrypts the SQLite DB to the storage channel.
+// verifies SQLite integrity, then gzips & encrypts the SQLite DB to the storage channel.
 func (e *Engine) BackupDBToTelegram(ctx context.Context) (*tg.UploadedDoc, error) {
 	if !e.IsReady() {
 		return nil, ErrNotReady
@@ -857,10 +1033,17 @@ func (e *Engine) BackupDBToTelegram(ctx context.Context) (*tg.UploadedDoc, error
 		return nil, ErrNotReady
 	}
 
-	_ = e.packer.FlushNow(ctx)
+	// Fail closed: never upload a DB backup while staged small-file packs failed to flush (TGMsgID=0).
+	if err := e.packer.FlushNow(ctx); err != nil {
+		return nil, fmt.Errorf("flush staged pack before backup: %w", err)
+	}
 
 	e.backupMu.Lock()
 	defer e.backupMu.Unlock()
+
+	if err := e.store.QuickCheck(); err != nil {
+		return nil, fmt.Errorf("refusing to backup corrupted sqlite db: %w", err)
+	}
 
 	rawSQLite, err := e.store.SnapshotBytes(e.tmpDir)
 	if err != nil {
@@ -876,11 +1059,15 @@ func (e *Engine) BackupDBToTelegram(ctx context.Context) (*tg.UploadedDoc, error
 	if err != nil {
 		return nil, err
 	}
-	_ = e.store.RecordBackup(doc.MsgID, time.Now().Unix())
+	if err := e.store.RecordBackup(doc.MsgID, time.Now().Unix()); err != nil {
+		slog.Warn("failed to record db backup metadata", "msg_id", doc.MsgID, "err", err)
+	}
 	e.MirrorMsgAsync(doc.MsgID, true)
 
-	// Keep only the latest DB backup on Telegram: delete any older .tmdb backups once the new upload succeeds.
-	if docs, err := e.tg.ListChannelDocs(ctx, DBBackupPrefix, 50); err == nil {
+	// Keep the latest DBBackupKeepCount rolling DB backups on Telegram and prune older ones.
+	if docs, err := e.tg.ListChannelDocs(ctx, DBBackupPrefix, 50); err != nil {
+		slog.Warn("list old db backups failed", "err", err)
+	} else {
 		sort.Slice(docs, func(i, j int) bool { return docs[i].MsgID > docs[j].MsgID })
 		var oldIDs []int
 		kept := 1 // count newly uploaded doc even if Telegram search index lags briefly
@@ -895,7 +1082,9 @@ func (e *Engine) BackupDBToTelegram(ctx context.Context) (*tg.UploadedDoc, error
 			oldIDs = append(oldIDs, d.MsgID)
 		}
 		if len(oldIDs) > 0 {
-			_ = e.tg.DeleteMessages(ctx, oldIDs)
+			if err := e.tg.DeleteMessages(ctx, oldIDs); err != nil {
+				slog.Warn("prune old db backups failed", "count", len(oldIDs), "err", err)
+			}
 		}
 	}
 	return doc, nil
@@ -982,9 +1171,11 @@ func (e *Engine) ScanOrphans(ctx context.Context) (*OrphanReport, error) {
 	if !e.IsReady() {
 		return nil, ErrNotReady
 	}
-	_ = e.packer.FlushNow(ctx)
+	if err := e.packer.FlushNow(ctx); err != nil {
+		return nil, fmt.Errorf("flush staged pack before orphan scan: %w", err)
+	}
 
-	docs, err := e.tg.ListChannelDocs(ctx, "", 10000)
+	docs, err := e.tg.ListChannelDocs(ctx, "", 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1008,6 +1199,77 @@ func (e *Engine) ScanOrphans(ctx context.Context) (*OrphanReport, error) {
 			rep.Orphans = append(rep.Orphans, d)
 			rep.TotalBytes += d.Size
 		}
+	}
+	return rep, nil
+}
+
+type messageChecker interface {
+	CheckMessages(ctx context.Context, msgIDs []int) (map[int]int64, error)
+}
+
+type VerifyReport struct {
+	CheckedBlobs     int      `json:"checked_blobs"`
+	HealthyBlobs     int      `json:"healthy_blobs"`
+	MissingOnPrimary []int    `json:"missing_on_primary,omitempty"`
+	SizeMismatches   []int    `json:"size_mismatches,omitempty"`
+	RecoverableBlobs []int    `json:"recoverable_blobs,omitempty"`
+	UnflushedParts   int64    `json:"unflushed_parts"`
+	SQLiteOK         bool     `json:"sqlite_ok"`
+	Errors           []string `json:"errors,omitempty"`
+}
+
+// VerifyVault scrubs SQLite integrity and verifies in batches of 100 that every referenced blob message
+// still exists on Telegram with the expected ciphertext size (and flags recoverable backup replicas if missing).
+func (e *Engine) VerifyVault(ctx context.Context) (*VerifyReport, error) {
+	if !e.IsReady() {
+		return nil, ErrNotReady
+	}
+	rep := &VerifyReport{SQLiteOK: true}
+	if err := e.store.QuickCheck(); err != nil {
+		rep.SQLiteOK = false
+		rep.Errors = append(rep.Errors, err.Error())
+	}
+	if unflushed, err := e.store.CountUnflushedParts(); err == nil {
+		rep.UnflushedParts = unflushed
+	}
+
+	blobs, err := e.store.ListReferencedBlobs()
+	if err != nil {
+		return rep, err
+	}
+	rep.CheckedBlobs = len(blobs)
+	if len(blobs) == 0 {
+		return rep, nil
+	}
+
+	checker, ok := e.tg.(messageChecker)
+	if !ok {
+		return rep, errors.New("telegram backend does not support message verification")
+	}
+
+	msgIDs := make([]int, len(blobs))
+	for i, b := range blobs {
+		msgIDs[i] = b.TGMsgID
+	}
+	present, err := checker.CheckMessages(ctx, msgIDs)
+	if err != nil {
+		return rep, fmt.Errorf("check primary channel messages: %w", err)
+	}
+
+	for _, b := range blobs {
+		gotSize, exists := present[b.TGMsgID]
+		if !exists {
+			rep.MissingOnPrimary = append(rep.MissingOnPrimary, b.TGMsgID)
+			if reps, rerr := e.store.GetBlobReplicas(b.TGMsgID); rerr == nil && len(reps) > 0 {
+				rep.RecoverableBlobs = append(rep.RecoverableBlobs, b.TGMsgID)
+			}
+			continue
+		}
+		if b.ExpectedSize > 0 && gotSize != b.ExpectedSize {
+			rep.SizeMismatches = append(rep.SizeMismatches, b.TGMsgID)
+			continue
+		}
+		rep.HealthyBlobs++
 	}
 	return rep, nil
 }

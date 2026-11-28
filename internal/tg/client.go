@@ -242,12 +242,15 @@ func (m *Manager) Start(parentCtx context.Context, apiID int, apiHash string) er
 	select {
 	case <-readyCh:
 		if errMsg := m.tracker.Snapshot().LastError; errMsg != "" && !m.tracker.Snapshot().Connected {
+			cancel()
 			return errors.New(errMsg)
 		}
 		return nil
 	case <-time.After(20 * time.Second):
+		cancel()
 		return errors.New("timed out connecting to Telegram")
 	case <-parentCtx.Done():
+		cancel()
 		return parentCtx.Err()
 	}
 }
@@ -447,35 +450,121 @@ func (m *Manager) Logout(ctx context.Context) error {
 	return nil
 }
 
-// ListPrivateChannels returns broadcast channels where the logged-in user is creator or admin.
-func (m *Manager) ListPrivateChannels(ctx context.Context) ([]ChannelInfo, error) {
+// fetchDialogChannels paginates through the user's dialogs (up to maxPages*100) and returns deduplicated channels.
+func (m *Manager) fetchDialogChannels(ctx context.Context, maxPages int) ([]*tg.Channel, error) {
 	c, err := m.getClient()
 	if err != nil {
 		return nil, err
 	}
+	if maxPages <= 0 {
+		maxPages = 10
+	}
+
+	seen := make(map[int64]struct{})
+	var out []*tg.Channel
+	var offsetDate, offsetID int
+	var offsetPeer tg.InputPeerClass = &tg.InputPeerEmpty{}
+
+	for page := 0; page < maxPages; page++ {
+		dialogsRes, err := c.API().MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+			OffsetDate: offsetDate,
+			OffsetID:   offsetID,
+			OffsetPeer: offsetPeer,
+			Limit:      100,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		var (
+			chats    []tg.ChatClass
+			users    []tg.UserClass
+			dialogs  []tg.DialogClass
+			messages []tg.MessageClass
+			isSlice  bool
+		)
+		switch d := dialogsRes.(type) {
+		case *tg.MessagesDialogs:
+			chats, users, dialogs, messages = d.Chats, d.Users, d.Dialogs, d.Messages
+		case *tg.MessagesDialogsSlice:
+			chats, users, dialogs, messages = d.Chats, d.Users, d.Dialogs, d.Messages
+			isSlice = true
+		}
+
+		channelByID := make(map[int64]*tg.Channel, len(chats))
+		for _, ch := range chats {
+			if channel, ok := ch.(*tg.Channel); ok {
+				channelByID[channel.ID] = channel
+				if _, dup := seen[channel.ID]; !dup {
+					seen[channel.ID] = struct{}{}
+					out = append(out, channel)
+				}
+			}
+		}
+
+		if !isSlice || len(dialogs) < 100 {
+			break
+		}
+		nextDate, nextID, nextPeer, ok := nextDialogCursor(dialogs, messages, users, channelByID)
+		if !ok || (nextDate == offsetDate && nextID == offsetID) {
+			break
+		}
+		offsetDate, offsetID, offsetPeer = nextDate, nextID, nextPeer
+	}
+	return out, nil
+}
+
+func nextDialogCursor(dialogs []tg.DialogClass, messages []tg.MessageClass, users []tg.UserClass, channels map[int64]*tg.Channel) (int, int, tg.InputPeerClass, bool) {
+	msgDate := make(map[int]int, len(messages))
+	for _, mc := range messages {
+		switch m := mc.(type) {
+		case *tg.Message:
+			msgDate[m.ID] = m.Date
+		case *tg.MessageService:
+			msgDate[m.ID] = m.Date
+		}
+	}
+	userHash := make(map[int64]int64, len(users))
+	for _, uc := range users {
+		if u, ok := uc.(*tg.User); ok {
+			userHash[u.ID] = u.AccessHash
+		}
+	}
+
+	for i := len(dialogs) - 1; i >= 0; i-- {
+		d, ok := dialogs[i].(*tg.Dialog)
+		if !ok {
+			continue
+		}
+		date := msgDate[d.TopMessage]
+		switch p := d.Peer.(type) {
+		case *tg.PeerChannel:
+			if ch, ok := channels[p.ChannelID]; ok {
+				return date, d.TopMessage, &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.AccessHash}, true
+			}
+		case *tg.PeerChat:
+			return date, d.TopMessage, &tg.InputPeerChat{ChatID: p.ChatID}, true
+		case *tg.PeerUser:
+			if h, ok := userHash[p.UserID]; ok {
+				return date, d.TopMessage, &tg.InputPeerUser{UserID: p.UserID, AccessHash: h}, true
+			}
+		}
+	}
+	return 0, 0, nil, false
+}
+
+// ListPrivateChannels returns broadcast channels where the logged-in user is creator or admin.
+func (m *Manager) ListPrivateChannels(ctx context.Context) ([]ChannelInfo, error) {
 	if !m.IsAuthorized() {
 		return nil, ErrNotAuthorized
 	}
-	dialogs, err := c.API().MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
-		OffsetPeer: &tg.InputPeerEmpty{},
-		Limit:      100,
-	})
+	channels, err := m.fetchDialogChannels(ctx, 10)
 	if err != nil {
 		return nil, err
 	}
-
-	var chats []tg.ChatClass
-	switch d := dialogs.(type) {
-	case *tg.MessagesDialogs:
-		chats = d.Chats
-	case *tg.MessagesDialogsSlice:
-		chats = d.Chats
-	}
-
-	out := make([]ChannelInfo, 0)
-	for _, ch := range chats {
-		channel, ok := ch.(*tg.Channel)
-		if !ok || !channel.Broadcast {
+	out := make([]ChannelInfo, 0, len(channels))
+	for _, channel := range channels {
+		if !channel.Broadcast {
 			continue
 		}
 		if !channel.Creator && channel.AdminRights.Zero() {
@@ -762,7 +851,9 @@ func (m *Manager) DeleteMessages(ctx context.Context, msgIDs []int) error {
 	return nil
 }
 
-// ListChannelDocs paginates the storage channel history and returns documents matching prefix (or all if prefix == "").
+// ListChannelDocs returns documents in the storage channel matching prefix (or all if prefix == "").
+// When prefix != "", it uses Telegram server-side MessagesSearch (O(1) RPC instead of scanning full channel history).
+// When limit <= 0, all matching messages are returned without an artificial cap.
 func (m *Manager) ListChannelDocs(ctx context.Context, prefix string, limit int) ([]ChannelDoc, error) {
 	c, err := m.getClient()
 	if err != nil {
@@ -772,18 +863,29 @@ func (m *Manager) ListChannelDocs(ctx context.Context, prefix string, limit int)
 	if err != nil {
 		return nil, err
 	}
-	if limit <= 0 {
-		limit = 5000
-	}
 
 	var out []ChannelDoc
 	offsetID := 0
-	for len(out) < limit {
-		res, err := c.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-			Peer:     peer,
-			OffsetID: offsetID,
-			Limit:    100,
-		})
+	for limit <= 0 || len(out) < limit {
+		var (
+			res tg.MessagesMessagesClass
+			err error
+		)
+		if prefix != "" {
+			res, err = c.API().MessagesSearch(ctx, &tg.MessagesSearchRequest{
+				Peer:     peer,
+				Q:        prefix,
+				Filter:   &tg.InputMessagesFilterDocument{},
+				OffsetID: offsetID,
+				Limit:    100,
+			})
+		} else {
+			res, err = c.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+				Peer:     peer,
+				OffsetID: offsetID,
+				Limit:    100,
+			})
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -825,7 +927,7 @@ func (m *Manager) ListChannelDocs(ctx context.Context, prefix string, limit int)
 				Size:       doc.Size,
 				Date:       msg.Date,
 			})
-			if len(out) >= limit {
+			if limit > 0 && len(out) >= limit {
 				break
 			}
 		}
@@ -837,10 +939,73 @@ func (m *Manager) ListChannelDocs(ctx context.Context, prefix string, limit int)
 	return out, nil
 }
 
+// CheckMessages verifies in batches of 100 which msgIDs currently exist as document messages in the storage channel
+// and returns a map of msgID -> document byte size.
+func (m *Manager) CheckMessages(ctx context.Context, msgIDs []int) (map[int]int64, error) {
+	if len(msgIDs) == 0 {
+		return map[int]int64{}, nil
+	}
+	c, err := m.getClient()
+	if err != nil {
+		return nil, err
+	}
+	if !m.IsAuthorized() {
+		return nil, ErrNotAuthorized
+	}
+	_, ch, err := m.channelPeer()
+	if err != nil {
+		return nil, err
+	}
+
+	found := make(map[int]int64, len(msgIDs))
+	const batchSize = 100
+	for i := 0; i < len(msgIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(msgIDs) {
+			end = len(msgIDs)
+		}
+		ids := make([]tg.InputMessageClass, 0, end-i)
+		for _, mid := range msgIDs[i:end] {
+			ids = append(ids, &tg.InputMessageID{ID: mid})
+		}
+		res, err := c.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+			Channel: ch,
+			ID:      ids,
+		})
+		if err != nil {
+			return nil, err
+		}
+		var msgs []tg.MessageClass
+		switch mm := res.(type) {
+		case *tg.MessagesChannelMessages:
+			msgs = mm.Messages
+		case *tg.MessagesMessages:
+			msgs = mm.Messages
+		case *tg.MessagesMessagesSlice:
+			msgs = mm.Messages
+		}
+		for _, mc := range msgs {
+			msg, ok := mc.(*tg.Message)
+			if !ok {
+				continue
+			}
+			if doc, ok := docFromMedia(msg.ID, msg.Media); ok {
+				found[msg.ID] = doc.Size
+			}
+		}
+	}
+	return found, nil
+}
+
+const maxSmallDocBytes int64 = 512 * 1024 * 1024
+
 // DownloadSmallDoc downloads an entire small document (e.g., encrypted DB backup) into RAM.
 func (m *Manager) DownloadSmallDoc(ctx context.Context, doc ChannelDoc) ([]byte, error) {
+	if doc.Size > maxSmallDocBytes {
+		return nil, fmt.Errorf("document size %d exceeds small-doc limit (%d)", doc.Size, maxSmallDocBytes)
+	}
 	var buf bytes.Buffer
-	if doc.Size > 0 {
+	if doc.Size > 0 && doc.Size <= 64*1024*1024 {
 		buf.Grow(int(doc.Size))
 	}
 	ref := DocRef{
@@ -866,6 +1031,9 @@ func (m *Manager) DownloadSmallDoc(ctx context.Context, doc ChannelDoc) ([]byte,
 		}
 		if len(chunk) == 0 {
 			break
+		}
+		if offset+int64(len(chunk)) > maxSmallDocBytes {
+			return nil, fmt.Errorf("document exceeded small-doc limit (%d bytes)", maxSmallDocBytes)
 		}
 		buf.Write(chunk)
 		offset += int64(len(chunk))
@@ -952,26 +1120,12 @@ func (m *Manager) JoinChannelByInvite(ctx context.Context, linkOrHash string, ex
 
 // FindDialogChannel locates a broadcast channel (even as a non-admin member) in this account's dialogs.
 func (m *Manager) FindDialogChannel(ctx context.Context, channelID int64) (*ChannelInfo, error) {
-	c, err := m.getClient()
+	channels, err := m.fetchDialogChannels(ctx, 10)
 	if err != nil {
 		return nil, err
 	}
-	dialogs, err := c.API().MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
-		OffsetPeer: &tg.InputPeerEmpty{},
-		Limit:      100,
-	})
-	if err != nil {
-		return nil, err
-	}
-	var chats []tg.ChatClass
-	switch d := dialogs.(type) {
-	case *tg.MessagesDialogs:
-		chats = d.Chats
-	case *tg.MessagesDialogsSlice:
-		chats = d.Chats
-	}
-	for _, ch := range chats {
-		if channel, ok := ch.(*tg.Channel); ok && channel.ID == channelID {
+	for _, channel := range channels {
+		if channel.ID == channelID {
 			return &ChannelInfo{
 				ID:         channel.ID,
 				AccessHash: channel.AccessHash,
@@ -1010,6 +1164,91 @@ func (m *Manager) ForwardCopyDoc(ctx context.Context, srcChannelID, srcAccessHas
 		return nil, fmt.Errorf("server-side copy msg %d: %w", srcMsgID, err)
 	}
 	return extractUploadedDoc(updates)
+}
+
+// ForwardCopyDocsBatch server-side copies up to 100 messages per RPC and returns srcMsgID -> UploadedDoc.
+func (m *Manager) ForwardCopyDocsBatch(ctx context.Context, srcChannelID, srcAccessHash int64, srcMsgIDs []int) (map[int]*UploadedDoc, error) {
+	if len(srcMsgIDs) == 0 {
+		return map[int]*UploadedDoc{}, nil
+	}
+	c, err := m.getClient()
+	if err != nil {
+		return nil, err
+	}
+	if !m.IsAuthorized() {
+		return nil, ErrNotAuthorized
+	}
+	dstPeer, _, err := m.channelPeer()
+	if err != nil {
+		return nil, err
+	}
+
+	rndToSrc := make(map[int64]int, len(srcMsgIDs))
+	rndIDs := make([]int64, len(srcMsgIDs))
+	for i, mid := range srcMsgIDs {
+		r := randomInt64()
+		for _, dup := rndToSrc[r]; dup; _, dup = rndToSrc[r] {
+			r = randomInt64()
+		}
+		rndIDs[i] = r
+		rndToSrc[r] = mid
+	}
+
+	req := &tg.MessagesForwardMessagesRequest{
+		Silent:     true,
+		DropAuthor: true,
+		FromPeer:   &tg.InputPeerChannel{ChannelID: srcChannelID, AccessHash: srcAccessHash},
+		ID:         srcMsgIDs,
+		RandomID:   rndIDs,
+		ToPeer:     dstPeer,
+	}
+	req.SetFlags()
+	updates, err := c.API().MessagesForwardMessages(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("batch server-side copy (%d msgs): %w", len(srcMsgIDs), err)
+	}
+	return extractBatchUploadedDocs(updates, rndToSrc), nil
+}
+
+func extractBatchUploadedDocs(updates tg.UpdatesClass, rndToSrc map[int64]int) map[int]*UploadedDoc {
+	var list []tg.UpdateClass
+	switch u := updates.(type) {
+	case *tg.Updates:
+		list = u.Updates
+	case *tg.UpdatesCombined:
+		list = u.Updates
+	}
+
+	newIDToSrc := make(map[int]int, len(rndToSrc))
+	docsByNewID := make(map[int]*UploadedDoc, len(rndToSrc))
+	for _, upd := range list {
+		switch u := upd.(type) {
+		case *tg.UpdateMessageID:
+			if srcID, ok := rndToSrc[u.RandomID]; ok {
+				newIDToSrc[u.ID] = srcID
+			}
+		case *tg.UpdateNewChannelMessage:
+			if msg, ok := u.Message.(*tg.Message); ok {
+				if doc, ok := docFromMedia(msg.ID, msg.Media); ok {
+					docsByNewID[msg.ID] = doc
+				}
+			}
+		case *tg.UpdateNewMessage:
+			if msg, ok := u.Message.(*tg.Message); ok {
+				if doc, ok := docFromMedia(msg.ID, msg.Media); ok {
+					docsByNewID[msg.ID] = doc
+				}
+			}
+		}
+	}
+
+	out := make(map[int]*UploadedDoc, len(newIDToSrc))
+	for newID, srcID := range newIDToSrc {
+		if doc, ok := docsByNewID[newID]; ok {
+			out[srcID] = doc
+		}
+	}
+	return out
 }
 
 func parseInviteHash(s string) string {

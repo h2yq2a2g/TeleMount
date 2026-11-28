@@ -7,16 +7,20 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 
 	"telemount/internal/db"
 )
 
+const maxPackRetryAttempts = 8
+
 type memPack struct {
-	id    string
-	buf   []byte
-	files int
+	id       string
+	buf      []byte
+	files    int
+	attempts int
 }
 
 type StagedPackStatus struct {
@@ -41,6 +45,7 @@ type Packer struct {
 	current   *memPack
 	memPacks  map[string]*memPack // holds open + currently-uploading packs so reads never miss
 	idleTimer *time.Timer
+	closed    bool
 
 	// Semaphore of capacity 1 bounds concurrent pack uploads so peak RAM never runs away under heavy bursts.
 	flushSem  chan struct{}
@@ -53,6 +58,16 @@ func newPacker(engine *Engine) *Packer {
 		memPacks: make(map[string]*memPack),
 		flushSem: make(chan struct{}, 1),
 	}
+}
+
+func (p *Packer) Close() {
+	p.mu.Lock()
+	p.closed = true
+	if p.idleTimer != nil {
+		p.idleTimer.Stop()
+		p.idleTimer = nil
+	}
+	p.mu.Unlock()
 }
 
 func newPackID() string {
@@ -171,7 +186,7 @@ func (p *Packer) StageSmallFile(
 	p.mu.Unlock()
 
 	if len(replaced) > 0 {
-		go p.engine.deleteBestEffort(replaced)
+		p.engine.deleteBestEffortAsync(replaced)
 	}
 	if readyToFlush != nil {
 		if err := p.flushPack(ctx, readyToFlush); err != nil {
@@ -182,6 +197,9 @@ func (p *Packer) StageSmallFile(
 }
 
 func (p *Packer) resetIdleTimerLocked(d time.Duration) {
+	if p.closed {
+		return
+	}
 	if d <= 0 {
 		d = 10 * time.Second
 	}
@@ -189,7 +207,12 @@ func (p *Packer) resetIdleTimerLocked(d time.Duration) {
 		p.idleTimer.Stop()
 	}
 	p.idleTimer = time.AfterFunc(d, func() {
-		_ = p.FlushNow(context.Background())
+		if p.engine.bgCtx.Err() != nil {
+			return
+		}
+		if err := p.FlushNow(p.engine.bgCtx); err != nil {
+			p.engine.recordBgError("pack_idle_flush", err)
+		}
 	})
 }
 
@@ -253,10 +276,25 @@ func (p *Packer) flushPack(ctx context.Context, mp *memPack) error {
 		p.engine.tg.Tracker().UpdateTransfer(trID, done)
 	})
 	if err != nil {
-		// Keep mp in memPacks so reads continue from RAM, and schedule automatic background retry if network blipped.
-		if ctx.Err() == nil {
-			time.AfterFunc(15*time.Second, func() {
-				_ = p.flushPack(context.Background(), mp)
+		// Keep mp in memPacks so reads continue from RAM, and schedule bounded exponential retry if network blipped.
+		if ctx.Err() == nil && p.engine.bgCtx.Err() == nil && mp.attempts < maxPackRetryAttempts {
+			mp.attempts++
+			backoff := time.Duration(15<<min(mp.attempts-1, 4)) * time.Second
+			if backoff > 5*time.Minute {
+				backoff = 5 * time.Minute
+			}
+			slog.Warn("pack upload failed; scheduling retry", "pack_id", mp.id, "attempt", mp.attempts, "backoff", backoff, "err", err)
+			p.engine.spawnBg(func(bgCtx context.Context) {
+				timer := time.NewTimer(backoff)
+				defer timer.Stop()
+				select {
+				case <-bgCtx.Done():
+					return
+				case <-timer.C:
+					if rerr := p.flushPack(bgCtx, mp); rerr != nil {
+						p.engine.recordBgError("pack_retry_flush", rerr)
+					}
+				}
 			})
 		}
 		return fmt.Errorf("upload pack %s: %w", mp.id, err)
@@ -270,7 +308,7 @@ func (p *Packer) flushPack(ctx context.Context, mp *memPack) error {
 	p.removeMemPack(mp.id)
 
 	if bound == 0 {
-		go p.engine.deleteBestEffort([]int{doc.MsgID})
+		p.engine.deleteBestEffortAsync([]int{doc.MsgID})
 	} else {
 		p.engine.MirrorMsgAsync(doc.MsgID, false)
 	}
@@ -350,10 +388,12 @@ func (p *Packer) CompactPacks(ctx context.Context) (*CompactReport, error) {
 			return nil
 		}
 
-		var buf bytes.Buffer
+		// Stream live encrypted segments directly into UploadBlob via io.Pipe so compaction uses O(1) RAM
+		// (~256 KiB copy buffer) instead of buffering an entire 1 GiB pack in memory.
+		var partsToCopy []db.FilePart
 		var relocated []db.RelocatedPart
 		var srcIDs []string
-		var oldTotal int64
+		var oldTotal, newSize int64
 
 		for _, pk := range b {
 			srcIDs = append(srcIDs, pk.PackID)
@@ -362,30 +402,64 @@ func (p *Packer) CompactPacks(ctx context.Context) (*CompactReport, error) {
 			if err != nil {
 				return err
 			}
-			for i := range parts {
-				pt := &parts[i]
-				newOff := int64(buf.Len())
-				seg := make([]byte, pt.CipherSize)
-				if err := p.engine.readPartCipherRaw(ctx, pt, 0, seg); err != nil {
-					return fmt.Errorf("read live part %d from pack %s: %w", pt.ID, pk.PackID, err)
-				}
-				buf.Write(seg)
-				relocated = append(relocated, db.RelocatedPart{PartID: pt.ID, NewOffset: newOff})
+			for _, pt := range parts {
+				relocated = append(relocated, db.RelocatedPart{PartID: pt.ID, NewOffset: newSize})
+				partsToCopy = append(partsToCopy, pt)
+				newSize += pt.CipherSize
 			}
 		}
 
-		if len(relocated) == 0 {
+		if len(relocated) == 0 || newSize == 0 {
 			return nil
 		}
 
 		newPackID := newPackID()
-		newSize := int64(buf.Len())
+		pr, pw := io.Pipe()
+		pipeCtx, pipeCancel := context.WithCancel(ctx)
+		defer pipeCancel()
+
+		var writeErr error
+		writeDone := make(chan struct{})
+		go func() {
+			defer close(writeDone)
+			chunkBuf := make([]byte, 256*1024)
+			for i := range partsToCopy {
+				pt := partsToCopy[i]
+				var off int64
+				for off < pt.CipherSize {
+					rem := pt.CipherSize - off
+					n := int64(len(chunkBuf))
+					if rem < n {
+						n = rem
+					}
+					if err := p.engine.readPartCipherRawUncached(pipeCtx, &pt, off, chunkBuf[:n]); err != nil {
+						writeErr = fmt.Errorf("read live part %d from pack %s: %w", pt.ID, pt.PackID, err)
+						_ = pw.CloseWithError(writeErr)
+						return
+					}
+					if _, err := pw.Write(chunkBuf[:n]); err != nil {
+						writeErr = err
+						_ = pw.CloseWithError(err)
+						return
+					}
+					off += n
+				}
+			}
+			_ = pw.Close()
+		}()
+
 		trID := p.engine.tg.Tracker().StartTransfer("upload", fmt.Sprintf("Compact (%d files)", len(relocated)), newSize)
-		doc, err := p.engine.tg.UploadBlob(ctx, newPackID+".bin", "", bytes.NewReader(buf.Bytes()), newSize, threads, func(done int64) {
+		doc, err := p.engine.tg.UploadBlob(pipeCtx, newPackID+".bin", "", pr, newSize, threads, func(done int64) {
 			p.engine.tg.Tracker().UpdateTransfer(trID, done)
 		})
 		p.engine.tg.Tracker().EndTransfer(trID)
+		_ = pr.Close()
+		pipeCancel()
+		<-writeDone
 		if err != nil {
+			if writeErr != nil {
+				return writeErr
+			}
 			return err
 		}
 
@@ -395,7 +469,7 @@ func (p *Packer) CompactPacks(ctx context.Context) (*CompactReport, error) {
 			return err
 		}
 		if len(oldMsgs) > 0 {
-			go p.engine.deleteBestEffort(oldMsgs)
+			p.engine.deleteBestEffortAsync(oldMsgs)
 		}
 		p.engine.MirrorMsgAsync(doc.MsgID, false)
 
@@ -426,6 +500,3 @@ func (p *Packer) CompactPacks(ctx context.Context) (*CompactReport, error) {
 	_ = p.engine.FlushPendingDeletes(ctx)
 	return rep, nil
 }
-
-// Ensure io import used cleanly if needed.
-var _ = io.EOF

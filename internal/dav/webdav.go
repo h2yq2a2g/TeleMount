@@ -5,9 +5,9 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
-	"path"
 	"strings"
 	"sync"
 	"time"
@@ -25,9 +25,57 @@ const (
 	ctxKeyContentType
 )
 
+type authFailTracker struct {
+	mu      sync.Mutex
+	entries map[string][]time.Time
+}
+
+func (a *authFailTracker) isBlocked(ip string) bool {
+	now := time.Now()
+	cutoff := now.Add(-5 * time.Minute)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	kept := a.entries[ip][:0]
+	for _, ts := range a.entries[ip] {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	if len(kept) == 0 {
+		delete(a.entries, ip)
+		return false
+	}
+	a.entries[ip] = kept
+	return len(kept) >= 20
+}
+
+func (a *authFailTracker) recordFailure(ip string) {
+	a.mu.Lock()
+	if a.entries == nil {
+		a.entries = make(map[string][]time.Time)
+	}
+	a.entries[ip] = append(a.entries[ip], time.Now())
+	a.mu.Unlock()
+}
+
+func (a *authFailTracker) clear(ip string) {
+	a.mu.Lock()
+	delete(a.entries, ip)
+	a.mu.Unlock()
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 type Handler struct {
-	engine *storage.Engine
-	dav    *webdav.Handler
+	engine   *storage.Engine
+	dav      *webdav.Handler
+	authFail authFailTracker
 }
 
 func NewHandler(prefix string, engine *storage.Engine) *Handler {
@@ -51,12 +99,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := clientIP(r)
+	if h.authFail.isBlocked(ip) {
+		http.Error(w, "Too Many Failed Authentication Attempts", http.StatusTooManyRequests)
+		return
+	}
+
 	user, pass, ok := r.BasicAuth()
 	if !ok || !h.engine.Store().VerifyWebDAV(user, pass) {
+		if ok {
+			h.authFail.recordFailure(ip)
+		}
 		w.Header().Set("WWW-Authenticate", `Basic realm="TeleMount WebDAV"`)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	h.authFail.clear(ip)
 
 	// Pass HTTP PUT Content-Length and Content-Type through context so OpenFile can stream directly on RAM.
 	ctx := context.WithValue(r.Context(), ctxKeyContentLength, r.ContentLength)
@@ -370,6 +428,3 @@ func (w *davWriteFile) Close() error {
 func (w *davWriteFile) Read([]byte) (int, error)          { return 0, os.ErrPermission }
 func (w *davWriteFile) Seek(int64, int) (int64, error)    { return 0, os.ErrInvalid }
 func (w *davWriteFile) Readdir(int) ([]os.FileInfo, error) { return nil, os.ErrInvalid }
-
-// Ensure unused path import isn't left behind; helper for normalizing virtual paths if needed.
-var _ = path.Clean

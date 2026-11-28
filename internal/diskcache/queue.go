@@ -269,15 +269,21 @@ func (e *engineBackend) Delete(ctx context.Context, p string, _ bool) error {
 	return e.engine.DeletePermanent(ctx, node.ID)
 }
 
-func (e *engineBackend) SetMtime(_ context.Context, p string, _ int64) error {
+func (e *engineBackend) SetMtime(_ context.Context, p string, mtime int64) error {
 	if !e.IsOnline() {
 		return storage.ErrNotReady
 	}
-	_, _, err := e.resolveNode(p)
+	node, _, err := e.resolveNode(p)
 	if errors.Is(err, db.ErrNotFound) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if mtime > 0 && e.store != nil {
+		return e.store.SetNodeMtime(node.ID, mtime)
+	}
+	return nil
 }
 
 func (e *engineBackend) FlushPending(ctx context.Context) error {
@@ -529,102 +535,99 @@ func (m *Manager) CommitFile(ctx context.Context, p string, stagedPath string, s
 		}
 	}()
 
-	m.stateMu.Lock()
-	// Re-validate under stateMu before committing SQLite tx.
-	parentOv, parentFound, err = m.statLocked(parentPath)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	if !parentFound || !parentOv.IsDir {
-		m.stateMu.Unlock()
-		return os.ErrInvalid
-	}
-	existingOv, existingFound, err = m.statLocked(normPath)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	if existingFound && existingOv.IsDir {
-		m.stateMu.Unlock()
-		return os.ErrInvalid
-	}
-	ctime := mtime
-	if existingFound && existingOv.Ctime > 0 {
-		ctime = existingOv.Ctime
-	}
-
-	pathLower := strings.ToLower(normPath)
-	parentLower := strings.ToLower(parentPath)
-	nowNS := time.Now().UnixNano()
-	accessNS := m.nextAccessNS()
-	pinnedInt := boolToInt(m.isPinnedLocked(normPath))
-
-	tx, err := m.db.Begin()
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	defer tx.Rollback()
-
-	res, err := tx.Exec(
-		`INSERT INTO write_queue (op_type, path, new_path, payload_file, size, mtime, is_dir, status, created_at_ns)
-		 VALUES (?, ?, '', ?, ?, ?, 0, 'pending', ?)`,
-		string(OpWrite), normPath, payloadFile, size, mtime, nowNS,
-	)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	opID, err := res.LastInsertId()
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-
 	var oldCacheBlob, oldOverlayBlob string
-	_ = tx.QueryRow(`SELECT blob_key FROM cache_entries WHERE path_lower = ?`, pathLower).Scan(&oldCacheBlob)
-	_ = tx.QueryRow(`SELECT blob_key FROM overlay_nodes WHERE path_lower = ?`, pathLower).Scan(&oldOverlayBlob)
+	if err := func() error {
+		m.stateMu.Lock()
+		defer m.stateMu.Unlock()
 
-	if _, err := tx.Exec(`
-		INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
-		VALUES (?, ?, ?, ?, 0, ?, ?, ?, 0, 1, ?, ?, ?)
-		ON CONFLICT(path_lower) DO UPDATE SET
-			path=excluded.path, parent_lower=excluded.parent_lower, name=excluded.name,
-			is_dir=0, size=excluded.size, mtime=excluded.mtime, ctime=excluded.ctime,
-			deleted=0, dirty=1, blob_key=excluded.blob_key, last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
-	`, pathLower, normPath, parentLower, baseName, size, mtime, ctime, blobKey, opID, nowNS); err != nil {
-		m.stateMu.Unlock()
+		// Re-validate under stateMu before committing SQLite tx.
+		parentOv, parentFound, err := m.statLocked(parentPath)
+		if err != nil {
+			return err
+		}
+		if !parentFound || !parentOv.IsDir {
+			return os.ErrInvalid
+		}
+		existingOv, existingFound, err := m.statLocked(normPath)
+		if err != nil {
+			return err
+		}
+		if existingFound && existingOv.IsDir {
+			return os.ErrInvalid
+		}
+		ctime := mtime
+		if existingFound && existingOv.Ctime > 0 {
+			ctime = existingOv.Ctime
+		}
+
+		pathLower := strings.ToLower(normPath)
+		parentLower := strings.ToLower(parentPath)
+		nowNS := time.Now().UnixNano()
+		accessNS := m.nextAccessNS()
+		pinnedInt := boolToInt(m.isPinnedLocked(normPath))
+
+		tx, err := m.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		res, err := tx.Exec(
+			`INSERT INTO write_queue (op_type, path, new_path, payload_file, size, mtime, is_dir, status, created_at_ns)
+			 VALUES (?, ?, '', ?, ?, ?, 0, 'pending', ?)`,
+			string(OpWrite), normPath, payloadFile, size, mtime, nowNS,
+		)
+		if err != nil {
+			return err
+		}
+		opID, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+
+		_ = tx.QueryRow(`SELECT blob_key FROM cache_entries WHERE path_lower = ?`, pathLower).Scan(&oldCacheBlob)
+		_ = tx.QueryRow(`SELECT blob_key FROM overlay_nodes WHERE path_lower = ?`, pathLower).Scan(&oldOverlayBlob)
+
+		if _, err := tx.Exec(`
+			INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
+			VALUES (?, ?, ?, ?, 0, ?, ?, ?, 0, 1, ?, ?, ?)
+			ON CONFLICT(path_lower) DO UPDATE SET
+				path=excluded.path, parent_lower=excluded.parent_lower, name=excluded.name,
+				is_dir=0, size=excluded.size, mtime=excluded.mtime, ctime=excluded.ctime,
+				deleted=0, dirty=1, blob_key=excluded.blob_key, last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
+		`, pathLower, normPath, parentLower, baseName, size, mtime, ctime, blobKey, opID, nowNS); err != nil {
+			return err
+		}
+
+		if _, err := tx.Exec(`
+			INSERT INTO cache_entries (path_lower, path, blob_key, size, mtime, last_accessed_ns, dirty, pinned, remote_node_id, remote_etag, last_op_id, created_at_ns, updated_at_ns)
+			VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0, '', ?, ?, ?)
+			ON CONFLICT(path_lower) DO UPDATE SET
+				path=excluded.path, blob_key=excluded.blob_key, size=excluded.size, mtime=excluded.mtime,
+				last_accessed_ns=excluded.last_accessed_ns, dirty=1, pinned=excluded.pinned,
+				remote_node_id=0, remote_etag='', last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
+		`, pathLower, normPath, blobKey, size, mtime, accessNS, pinnedInt, opID, nowNS, nowNS); err != nil {
+			return err
+		}
+
+		if _, err := tx.Exec(`
+			INSERT INTO node_meta (path_lower, path, mtime, etag)
+			VALUES (?, ?, ?, '')
+			ON CONFLICT(path_lower) DO UPDATE SET path=excluded.path, mtime=excluded.mtime, etag=''
+		`, pathLower, normPath, mtime); err != nil {
+			return err
+		}
+
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		m.lastTouchedPath = pathLower
+		m.lastTouchedAt = time.Now()
+		cleanupNewFiles = false
+		return nil
+	}(); err != nil {
 		return err
 	}
-
-	if _, err := tx.Exec(`
-		INSERT INTO cache_entries (path_lower, path, blob_key, size, mtime, last_accessed_ns, dirty, pinned, remote_node_id, remote_etag, last_op_id, created_at_ns, updated_at_ns)
-		VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0, '', ?, ?, ?)
-		ON CONFLICT(path_lower) DO UPDATE SET
-			path=excluded.path, blob_key=excluded.blob_key, size=excluded.size, mtime=excluded.mtime,
-			last_accessed_ns=excluded.last_accessed_ns, dirty=1, pinned=excluded.pinned,
-			remote_node_id=0, remote_etag='', last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
-	`, pathLower, normPath, blobKey, size, mtime, accessNS, pinnedInt, opID, nowNS, nowNS); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-
-	if _, err := tx.Exec(`
-		INSERT INTO node_meta (path_lower, path, mtime, etag)
-		VALUES (?, ?, ?, '')
-		ON CONFLICT(path_lower) DO UPDATE SET path=excluded.path, mtime=excluded.mtime, etag=''
-	`, pathLower, normPath, mtime); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-
-	if err := tx.Commit(); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	cleanupNewFiles = false
-	m.stateMu.Unlock()
 
 	m.scheduleBlobDeletes([]string{oldCacheBlob, oldOverlayBlob})
 	m.notifyChange(normPath)
@@ -641,73 +644,66 @@ func (m *Manager) QueueMkdir(ctx context.Context, p string) error {
 		return err
 	}
 
-	m.stateMu.Lock()
-	parentPath := parentOfNormalized(normPath)
-	parentOv, parentFound, err := m.statLocked(parentPath)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	if !parentFound {
-		m.stateMu.Unlock()
-		return os.ErrNotExist
-	}
-	if !parentOv.IsDir {
-		m.stateMu.Unlock()
-		return os.ErrInvalid
-	}
-	if _, exists, err := m.statLocked(normPath); err != nil {
-		m.stateMu.Unlock()
-		return err
-	} else if exists {
-		m.stateMu.Unlock()
-		return os.ErrExist
-	}
+	if err := func() error {
+		m.stateMu.Lock()
+		defer m.stateMu.Unlock()
 
-	now := time.Now().Unix()
-	nowNS := time.Now().UnixNano()
-	pathLower := strings.ToLower(normPath)
-	parentLower := strings.ToLower(parentPath)
+		parentPath := parentOfNormalized(normPath)
+		parentOv, parentFound, err := m.statLocked(parentPath)
+		if err != nil {
+			return err
+		}
+		if !parentFound {
+			return os.ErrNotExist
+		}
+		if !parentOv.IsDir {
+			return os.ErrInvalid
+		}
+		if _, exists, err := m.statLocked(normPath); err != nil {
+			return err
+		} else if exists {
+			return os.ErrExist
+		}
 
-	tx, err := m.db.Begin()
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	defer tx.Rollback()
+		now := time.Now().Unix()
+		nowNS := time.Now().UnixNano()
+		pathLower := strings.ToLower(normPath)
+		parentLower := strings.ToLower(parentPath)
 
-	res, err := tx.Exec(
-		`INSERT INTO write_queue (op_type, path, new_path, payload_file, size, mtime, is_dir, status, created_at_ns)
-		 VALUES (?, ?, '', '', 0, ?, 1, 'pending', ?)`,
-		string(OpMkdir), normPath, now, nowNS,
-	)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	opID, err := res.LastInsertId()
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
+		tx, err := m.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
 
-	if _, err := tx.Exec(`
-		INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
-		VALUES (?, ?, ?, ?, 1, 0, ?, ?, 0, 1, '', ?, ?)
-		ON CONFLICT(path_lower) DO UPDATE SET
-			path=excluded.path, parent_lower=excluded.parent_lower, name=excluded.name,
-			is_dir=1, size=0, mtime=excluded.mtime, ctime=excluded.ctime,
-			deleted=0, dirty=1, blob_key='', last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
-	`, pathLower, normPath, parentLower, baseName, now, now, opID, nowNS); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
+		res, err := tx.Exec(
+			`INSERT INTO write_queue (op_type, path, new_path, payload_file, size, mtime, is_dir, status, created_at_ns)
+			 VALUES (?, ?, '', '', 0, ?, 1, 'pending', ?)`,
+			string(OpMkdir), normPath, now, nowNS,
+		)
+		if err != nil {
+			return err
+		}
+		opID, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
 
-	if err := tx.Commit(); err != nil {
-		m.stateMu.Unlock()
+		if _, err := tx.Exec(`
+			INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
+			VALUES (?, ?, ?, ?, 1, 0, ?, ?, 0, 1, '', ?, ?)
+			ON CONFLICT(path_lower) DO UPDATE SET
+				path=excluded.path, parent_lower=excluded.parent_lower, name=excluded.name,
+				is_dir=1, size=0, mtime=excluded.mtime, ctime=excluded.ctime,
+				deleted=0, dirty=1, blob_key='', last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
+		`, pathLower, normPath, parentLower, baseName, now, now, opID, nowNS); err != nil {
+			return err
+		}
+
+		return tx.Commit()
+	}(); err != nil {
 		return err
 	}
-	m.stateMu.Unlock()
 	m.notifyChange(normPath)
 
 	m.triggerFlush(ctx)
@@ -764,272 +760,259 @@ func (m *Manager) QueueRename(ctx context.Context, oldPath, newPath string) erro
 		return db.ErrInvalidMove
 	}
 
-	m.stateMu.Lock()
-	newParent := parentOfNormalized(normNew)
-	newParentOv, newParentFound, err := m.statLocked(newParent)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	if !newParentFound {
-		m.stateMu.Unlock()
-		return os.ErrNotExist
-	}
-	if !newParentOv.IsDir {
-		m.stateMu.Unlock()
-		return os.ErrInvalid
-	}
+	var blobsToDelete []string
+	if err := func() error {
+		m.stateMu.Lock()
+		defer m.stateMu.Unlock()
 
-	subtree, err := m.collectLiveSubtreeLocked(normOld)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	srcRoot := subtree[0]
-
-	var dstSubtree []NodeOverlay
-	if oldLower != newLower {
-		dstOv, dstFound, err := m.statLocked(normNew)
+		newParent := parentOfNormalized(normNew)
+		newParentOv, newParentFound, err := m.statLocked(newParent)
 		if err != nil {
-			m.stateMu.Unlock()
 			return err
 		}
-		if dstFound {
-			if dstOv.IsDir != srcRoot.IsDir {
-				m.stateMu.Unlock()
-				return os.ErrInvalid
+		if !newParentFound {
+			return os.ErrNotExist
+		}
+		if !newParentOv.IsDir {
+			return os.ErrInvalid
+		}
+
+		subtree, err := m.collectLiveSubtreeLocked(normOld)
+		if err != nil {
+			return err
+		}
+		srcRoot := subtree[0]
+
+		var dstSubtree []NodeOverlay
+		if oldLower != newLower {
+			dstOv, dstFound, err := m.statLocked(normNew)
+			if err != nil {
+				return err
 			}
-			if dstOv.IsDir {
-				children, cerr := m.listDirLocked(normNew)
-				if cerr != nil {
-					m.stateMu.Unlock()
-					return cerr
-				}
-				if len(children) > 0 {
-					m.stateMu.Unlock()
+			if dstFound {
+				if dstOv.IsDir != srcRoot.IsDir {
 					return os.ErrInvalid
 				}
+				if dstOv.IsDir {
+					children, cerr := m.listDirLocked(normNew)
+					if cerr != nil {
+						return cerr
+					}
+					if len(children) > 0 {
+						return os.ErrInvalid
+					}
+				}
+				dstSubtree, _ = m.collectLiveSubtreeLocked(normNew)
 			}
-			dstSubtree, _ = m.collectLiveSubtreeLocked(normNew)
 		}
-	}
 
-	nowNS := time.Now().UnixNano()
-	tx, err := m.db.Begin()
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	defer tx.Rollback()
-
-	res, err := tx.Exec(
-		`INSERT INTO write_queue (op_type, path, new_path, payload_file, size, mtime, is_dir, status, created_at_ns)
-		 VALUES (?, ?, ?, '', 0, 0, ?, 'pending', ?)`,
-		string(OpRename), normOld, normNew, boolToInt(srcRoot.IsDir), nowNS,
-	)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	opID, err := res.LastInsertId()
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-
-	var blobsToDelete []string
-
-	// Tombstone overwritten destination if any.
-	for _, dn := range dstSubtree {
-		dLower := strings.ToLower(dn.Path)
-		dParentLower := strings.ToLower(parentOfNormalized(dn.Path))
-		_, dBase := path.Split(dn.Path)
-		if _, err := tx.Exec(`
-			INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
-			VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, 1, '', ?, ?)
-			ON CONFLICT(path_lower) DO UPDATE SET
-				deleted=1, dirty=1, blob_key='', last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
-		`, dLower, dn.Path, dParentLower, dBase, boolToInt(dn.IsDir), dn.Mtime, dn.Ctime, opID, nowNS); err != nil {
-			m.stateMu.Unlock()
+		nowNS := time.Now().UnixNano()
+		tx, err := m.db.Begin()
+		if err != nil {
 			return err
 		}
-		var bKey string
-		if err := tx.QueryRow(`SELECT blob_key FROM cache_entries WHERE path_lower = ?`, dLower).Scan(&bKey); err == nil && bKey != "" {
-			blobsToDelete = append(blobsToDelete, bKey)
-		}
-		if _, err := tx.Exec(`DELETE FROM cache_entries WHERE path_lower = ?`, dLower); err != nil {
-			m.stateMu.Unlock()
+		defer tx.Rollback()
+
+		res, err := tx.Exec(
+			`INSERT INTO write_queue (op_type, path, new_path, payload_file, size, mtime, is_dir, status, created_at_ns)
+			 VALUES (?, ?, ?, '', 0, 0, ?, 'pending', ?)`,
+			string(OpRename), normOld, normNew, boolToInt(srcRoot.IsDir), nowNS,
+		)
+		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`DELETE FROM node_meta WHERE path_lower = ?`, dLower); err != nil {
-			m.stateMu.Unlock()
+		opID, err := res.LastInsertId()
+		if err != nil {
 			return err
 		}
-	}
 
-	// Capture existing cache_entries under old subtree so we re-key them accurately.
-	oldPrefixStart, oldPrefixEnd := subtreeBounds(oldLower)
-	ceRows, err := tx.Query(
-		`SELECT path, path_lower, blob_key, size, mtime, last_accessed_ns, dirty, remote_node_id, remote_etag, created_at_ns, updated_at_ns
-		 FROM cache_entries WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
-		oldLower, oldPrefixStart, oldPrefixEnd,
-	)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	var movedEntries []cacheEntry
-	for ceRows.Next() {
-		var ce cacheEntry
-		var dirtyInt int
-		if err := ceRows.Scan(&ce.Path, &ce.PathLower, &ce.BlobKey, &ce.Size, &ce.Mtime, &ce.LastAccessedNS, &dirtyInt, &ce.RemoteNodeID, &ce.RemoteETag, &ce.CreatedAtNS, &ce.UpdatedAtNS); err != nil {
-			_ = ceRows.Close()
-			m.stateMu.Unlock()
-			return err
-		}
-		ce.Dirty = dirtyInt != 0
-		movedEntries = append(movedEntries, ce)
-	}
-	if err := ceRows.Close(); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-
-	cacheBlobByLower := make(map[string]string, len(movedEntries))
-	for _, ce := range movedEntries {
-		cacheBlobByLower[ce.PathLower] = ce.BlobKey
-	}
-
-	// Capture existing node_meta under old subtree.
-	nmRows, err := tx.Query(
-		`SELECT path, path_lower, mtime, etag FROM node_meta WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
-		oldLower, oldPrefixStart, oldPrefixEnd,
-	)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	type nmRow struct {
-		path, pathLower, etag string
-		mtime                 int64
-	}
-	var movedMeta []nmRow
-	for nmRows.Next() {
-		var r nmRow
-		if err := nmRows.Scan(&r.path, &r.pathLower, &r.mtime, &r.etag); err != nil {
-			_ = nmRows.Close()
-			m.stateMu.Unlock()
-			return err
-		}
-		movedMeta = append(movedMeta, r)
-	}
-	if err := nmRows.Close(); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-
-	// Materialize moved nodes and tombstone old paths.
-	for _, n := range subtree {
-		nLower := strings.ToLower(n.Path)
-		rel := ""
-		if len(n.Path) > len(normOld) {
-			rel = n.Path[len(normOld):]
-		}
-		mappedPath := normNew + rel
-		mappedLower := strings.ToLower(mappedPath)
-		mappedParentLower := strings.ToLower(parentOfNormalized(mappedPath))
-		_, mappedBase := path.Split(mappedPath)
-
-		blobKey := cacheBlobByLower[nLower]
-		if blobKey == "" {
-			_ = tx.QueryRow(`SELECT blob_key FROM overlay_nodes WHERE path_lower = ?`, nLower).Scan(&blobKey)
-		}
-
-		if oldLower != newLower {
-			nParentLower := strings.ToLower(parentOfNormalized(n.Path))
-			_, nBase := path.Split(n.Path)
+		// Tombstone overwritten destination if any.
+		for _, dn := range dstSubtree {
+			dLower := strings.ToLower(dn.Path)
+			dParentLower := strings.ToLower(parentOfNormalized(dn.Path))
+			_, dBase := path.Split(dn.Path)
 			if _, err := tx.Exec(`
 				INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
 				VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, 1, '', ?, ?)
 				ON CONFLICT(path_lower) DO UPDATE SET
 					deleted=1, dirty=1, blob_key='', last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
-			`, nLower, n.Path, nParentLower, nBase, boolToInt(n.IsDir), n.Mtime, n.Ctime, opID, nowNS); err != nil {
-				m.stateMu.Unlock()
+			`, dLower, dn.Path, dParentLower, dBase, boolToInt(dn.IsDir), dn.Mtime, dn.Ctime, opID, nowNS); err != nil {
+				return err
+			}
+			var bKey string
+			if err := tx.QueryRow(`SELECT blob_key FROM cache_entries WHERE path_lower = ?`, dLower).Scan(&bKey); err == nil && bKey != "" {
+				blobsToDelete = append(blobsToDelete, bKey)
+			}
+			if _, err := tx.Exec(`DELETE FROM cache_entries WHERE path_lower = ?`, dLower); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DELETE FROM node_meta WHERE path_lower = ?`, dLower); err != nil {
 				return err
 			}
 		}
 
-		if _, err := tx.Exec(`
-			INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?)
-			ON CONFLICT(path_lower) DO UPDATE SET
-				path=excluded.path, parent_lower=excluded.parent_lower, name=excluded.name,
-				is_dir=excluded.is_dir, size=excluded.size, mtime=excluded.mtime, ctime=excluded.ctime,
-				deleted=0, dirty=1, blob_key=excluded.blob_key, last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
-		`, mappedLower, mappedPath, mappedParentLower, mappedBase, boolToInt(n.IsDir), n.Size, n.Mtime, n.Ctime, blobKey, opID, nowNS); err != nil {
-			m.stateMu.Unlock()
+		// Capture existing cache_entries under old subtree so we re-key them accurately.
+		oldPrefixStart, oldPrefixEnd := subtreeBounds(oldLower)
+		ceRows, err := tx.Query(
+			`SELECT path, path_lower, blob_key, size, mtime, last_accessed_ns, dirty, remote_node_id, remote_etag, created_at_ns, updated_at_ns
+			 FROM cache_entries WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
+			oldLower, oldPrefixStart, oldPrefixEnd,
+		)
+		if err != nil {
 			return err
 		}
-	}
-
-	// Re-key cache_entries under old subtree -> new subtree.
-	if _, err := tx.Exec(
-		`DELETE FROM cache_entries WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
-		oldLower, oldPrefixStart, oldPrefixEnd,
-	); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	for _, ce := range movedEntries {
-		rel := ""
-		if len(ce.Path) > len(normOld) {
-			rel = ce.Path[len(normOld):]
+		var movedEntries []cacheEntry
+		for ceRows.Next() {
+			var ce cacheEntry
+			var dirtyInt int
+			if err := ceRows.Scan(&ce.Path, &ce.PathLower, &ce.BlobKey, &ce.Size, &ce.Mtime, &ce.LastAccessedNS, &dirtyInt, &ce.RemoteNodeID, &ce.RemoteETag, &ce.CreatedAtNS, &ce.UpdatedAtNS); err != nil {
+				_ = ceRows.Close()
+				return err
+			}
+			ce.Dirty = dirtyInt != 0
+			movedEntries = append(movedEntries, ce)
 		}
-		mappedPath := normNew + rel
-		mappedLower := strings.ToLower(mappedPath)
-		pinnedInt := boolToInt(m.isPinnedLocked(mappedPath))
-		if _, err := tx.Exec(`
-			INSERT INTO cache_entries (path_lower, path, blob_key, size, mtime, last_accessed_ns, dirty, pinned, remote_node_id, remote_etag, last_op_id, created_at_ns, updated_at_ns)
-			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(path_lower) DO UPDATE SET
-				path=excluded.path, blob_key=excluded.blob_key, size=excluded.size, mtime=excluded.mtime,
-				last_accessed_ns=excluded.last_accessed_ns, dirty=1, pinned=excluded.pinned,
-				remote_node_id=excluded.remote_node_id, remote_etag=excluded.remote_etag, last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
-		`, mappedLower, mappedPath, ce.BlobKey, ce.Size, ce.Mtime, ce.LastAccessedNS, pinnedInt, ce.RemoteNodeID, ce.RemoteETag, opID, ce.CreatedAtNS, nowNS); err != nil {
-			m.stateMu.Unlock()
+		if err := ceRows.Err(); err != nil {
+			_ = ceRows.Close()
 			return err
 		}
-	}
-
-	// Re-key node_meta.
-	if _, err := tx.Exec(
-		`DELETE FROM node_meta WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
-		oldLower, oldPrefixStart, oldPrefixEnd,
-	); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	for _, rm := range movedMeta {
-		rel := ""
-		if len(rm.path) > len(normOld) {
-			rel = rm.path[len(normOld):]
-		}
-		mappedPath := normNew + rel
-		mappedLower := strings.ToLower(mappedPath)
-		if _, err := tx.Exec(`
-			INSERT INTO node_meta (path_lower, path, mtime, etag) VALUES (?, ?, ?, ?)
-			ON CONFLICT(path_lower) DO UPDATE SET path=excluded.path, mtime=excluded.mtime, etag=excluded.etag
-		`, mappedLower, mappedPath, rm.mtime, rm.etag); err != nil {
-			m.stateMu.Unlock()
+		if err := ceRows.Close(); err != nil {
 			return err
 		}
-	}
 
-	if err := tx.Commit(); err != nil {
-		m.stateMu.Unlock()
+		cacheBlobByLower := make(map[string]string, len(movedEntries))
+		for _, ce := range movedEntries {
+			cacheBlobByLower[ce.PathLower] = ce.BlobKey
+		}
+
+		// Capture existing node_meta under old subtree.
+		nmRows, err := tx.Query(
+			`SELECT path, path_lower, mtime, etag FROM node_meta WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
+			oldLower, oldPrefixStart, oldPrefixEnd,
+		)
+		if err != nil {
+			return err
+		}
+		type nmRow struct {
+			path, pathLower, etag string
+			mtime                 int64
+		}
+		var movedMeta []nmRow
+		for nmRows.Next() {
+			var r nmRow
+			if err := nmRows.Scan(&r.path, &r.pathLower, &r.mtime, &r.etag); err != nil {
+				_ = nmRows.Close()
+				return err
+			}
+			movedMeta = append(movedMeta, r)
+		}
+		if err := nmRows.Err(); err != nil {
+			_ = nmRows.Close()
+			return err
+		}
+		if err := nmRows.Close(); err != nil {
+			return err
+		}
+
+		// Materialize moved nodes and tombstone old paths.
+		for _, n := range subtree {
+			nLower := strings.ToLower(n.Path)
+			rel := ""
+			if len(n.Path) > len(normOld) {
+				rel = n.Path[len(normOld):]
+			}
+			mappedPath := normNew + rel
+			mappedLower := strings.ToLower(mappedPath)
+			mappedParentLower := strings.ToLower(parentOfNormalized(mappedPath))
+			_, mappedBase := path.Split(mappedPath)
+
+			blobKey := cacheBlobByLower[nLower]
+			if blobKey == "" {
+				_ = tx.QueryRow(`SELECT blob_key FROM overlay_nodes WHERE path_lower = ?`, nLower).Scan(&blobKey)
+			}
+
+			if oldLower != newLower {
+				nParentLower := strings.ToLower(parentOfNormalized(n.Path))
+				_, nBase := path.Split(n.Path)
+				if _, err := tx.Exec(`
+					INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
+					VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, 1, '', ?, ?)
+					ON CONFLICT(path_lower) DO UPDATE SET
+						deleted=1, dirty=1, blob_key='', last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
+				`, nLower, n.Path, nParentLower, nBase, boolToInt(n.IsDir), n.Mtime, n.Ctime, opID, nowNS); err != nil {
+					return err
+				}
+			}
+
+			if _, err := tx.Exec(`
+				INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?)
+				ON CONFLICT(path_lower) DO UPDATE SET
+					path=excluded.path, parent_lower=excluded.parent_lower, name=excluded.name,
+					is_dir=excluded.is_dir, size=excluded.size, mtime=excluded.mtime, ctime=excluded.ctime,
+					deleted=0, dirty=1, blob_key=excluded.blob_key, last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
+			`, mappedLower, mappedPath, mappedParentLower, mappedBase, boolToInt(n.IsDir), n.Size, n.Mtime, n.Ctime, blobKey, opID, nowNS); err != nil {
+				return err
+			}
+		}
+
+		// Re-key cache_entries under old subtree -> new subtree.
+		if _, err := tx.Exec(
+			`DELETE FROM cache_entries WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
+			oldLower, oldPrefixStart, oldPrefixEnd,
+		); err != nil {
+			return err
+		}
+		for _, ce := range movedEntries {
+			rel := ""
+			if len(ce.Path) > len(normOld) {
+				rel = ce.Path[len(normOld):]
+			}
+			mappedPath := normNew + rel
+			mappedLower := strings.ToLower(mappedPath)
+			pinnedInt := boolToInt(m.isPinnedLocked(mappedPath))
+			if _, err := tx.Exec(`
+				INSERT INTO cache_entries (path_lower, path, blob_key, size, mtime, last_accessed_ns, dirty, pinned, remote_node_id, remote_etag, last_op_id, created_at_ns, updated_at_ns)
+				VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(path_lower) DO UPDATE SET
+					path=excluded.path, blob_key=excluded.blob_key, size=excluded.size, mtime=excluded.mtime,
+					last_accessed_ns=excluded.last_accessed_ns, dirty=1, pinned=excluded.pinned,
+					remote_node_id=excluded.remote_node_id, remote_etag=excluded.remote_etag, last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
+			`, mappedLower, mappedPath, ce.BlobKey, ce.Size, ce.Mtime, ce.LastAccessedNS, pinnedInt, ce.RemoteNodeID, ce.RemoteETag, opID, ce.CreatedAtNS, nowNS); err != nil {
+				return err
+			}
+		}
+
+		// Re-key node_meta.
+		if _, err := tx.Exec(
+			`DELETE FROM node_meta WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
+			oldLower, oldPrefixStart, oldPrefixEnd,
+		); err != nil {
+			return err
+		}
+		for _, rm := range movedMeta {
+			rel := ""
+			if len(rm.path) > len(normOld) {
+				rel = rm.path[len(normOld):]
+			}
+			mappedPath := normNew + rel
+			mappedLower := strings.ToLower(mappedPath)
+			if _, err := tx.Exec(`
+				INSERT INTO node_meta (path_lower, path, mtime, etag) VALUES (?, ?, ?, ?)
+				ON CONFLICT(path_lower) DO UPDATE SET path=excluded.path, mtime=excluded.mtime, etag=excluded.etag
+			`, mappedLower, mappedPath, rm.mtime, rm.etag); err != nil {
+				return err
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		m.lastTouchedPath = ""
+		return nil
+	}(); err != nil {
 		return err
 	}
-	m.stateMu.Unlock()
 
 	m.scheduleBlobDeletes(blobsToDelete)
 	m.notifyChange(normOld, normNew)
@@ -1045,102 +1028,100 @@ func (m *Manager) QueueDelete(ctx context.Context, p string, isDir bool) error {
 		return err
 	}
 
-	m.stateMu.Lock()
-	subtree, err := m.collectLiveSubtreeLocked(normPath)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	if subtree[0].IsDir != isDir {
-		m.stateMu.Unlock()
-		return os.ErrInvalid
-	}
+	var blobsToDelete []string
+	if err := func() error {
+		m.stateMu.Lock()
+		defer m.stateMu.Unlock()
 
-	pathLower := strings.ToLower(normPath)
-	prefixStart, prefixEnd := subtreeBounds(pathLower)
-	nowNS := time.Now().UnixNano()
-
-	tx, err := m.db.Begin()
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	defer tx.Rollback()
-
-	res, err := tx.Exec(
-		`INSERT INTO write_queue (op_type, path, new_path, payload_file, size, mtime, is_dir, status, created_at_ns)
-		 VALUES (?, ?, '', '', 0, 0, ?, 'pending', ?)`,
-		string(OpDelete), normPath, boolToInt(isDir), nowNS,
-	)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	opID, err := res.LastInsertId()
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-
-	for _, n := range subtree {
-		nLower := strings.ToLower(n.Path)
-		nParentLower := strings.ToLower(parentOfNormalized(n.Path))
-		_, nBase := path.Split(n.Path)
-		if _, err := tx.Exec(`
-			INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
-			VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, 1, '', ?, ?)
-			ON CONFLICT(path_lower) DO UPDATE SET
-				deleted=1, dirty=1, blob_key='', last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
-		`, nLower, n.Path, nParentLower, nBase, boolToInt(n.IsDir), n.Mtime, n.Ctime, opID, nowNS); err != nil {
-			m.stateMu.Unlock()
+		subtree, err := m.collectLiveSubtreeLocked(normPath)
+		if err != nil {
 			return err
 		}
-	}
+		if subtree[0].IsDir != isDir {
+			return os.ErrInvalid
+		}
 
-	// Ensure any existing overlay rows under this path are also marked deleted with opID.
-	if _, err := tx.Exec(`
-		UPDATE overlay_nodes SET deleted = 1, dirty = 1, blob_key = '', last_op_id = ?, updated_at_ns = ?
-		WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)
-	`, opID, nowNS, pathLower, prefixStart, prefixEnd); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
+		pathLower := strings.ToLower(normPath)
+		prefixStart, prefixEnd := subtreeBounds(pathLower)
+		nowNS := time.Now().UnixNano()
 
-	var blobsToDelete []string
-	rows, err := tx.Query(
-		`SELECT blob_key FROM cache_entries WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
-		pathLower, prefixStart, prefixEnd,
-	)
-	if err == nil {
-		for rows.Next() {
-			var k string
-			if err := rows.Scan(&k); err == nil && k != "" {
-				blobsToDelete = append(blobsToDelete, k)
+		tx, err := m.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		res, err := tx.Exec(
+			`INSERT INTO write_queue (op_type, path, new_path, payload_file, size, mtime, is_dir, status, created_at_ns)
+			 VALUES (?, ?, '', '', 0, 0, ?, 'pending', ?)`,
+			string(OpDelete), normPath, boolToInt(isDir), nowNS,
+		)
+		if err != nil {
+			return err
+		}
+		opID, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+
+		for _, n := range subtree {
+			nLower := strings.ToLower(n.Path)
+			nParentLower := strings.ToLower(parentOfNormalized(n.Path))
+			_, nBase := path.Split(n.Path)
+			if _, err := tx.Exec(`
+				INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
+				VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, 1, '', ?, ?)
+				ON CONFLICT(path_lower) DO UPDATE SET
+					deleted=1, dirty=1, blob_key='', last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
+			`, nLower, n.Path, nParentLower, nBase, boolToInt(n.IsDir), n.Mtime, n.Ctime, opID, nowNS); err != nil {
+				return err
 			}
 		}
-		_ = rows.Close()
-	}
 
-	if _, err := tx.Exec(
-		`DELETE FROM cache_entries WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
-		pathLower, prefixStart, prefixEnd,
-	); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	if _, err := tx.Exec(
-		`DELETE FROM node_meta WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
-		pathLower, prefixStart, prefixEnd,
-	); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
+		// Ensure any existing overlay rows under this path are also marked deleted with opID.
+		if _, err := tx.Exec(`
+			UPDATE overlay_nodes SET deleted = 1, dirty = 1, blob_key = '', last_op_id = ?, updated_at_ns = ?
+			WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)
+		`, opID, nowNS, pathLower, prefixStart, prefixEnd); err != nil {
+			return err
+		}
 
-	if err := tx.Commit(); err != nil {
-		m.stateMu.Unlock()
+		rows, err := tx.Query(
+			`SELECT blob_key FROM cache_entries WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
+			pathLower, prefixStart, prefixEnd,
+		)
+		if err == nil {
+			for rows.Next() {
+				var k string
+				if err := rows.Scan(&k); err == nil && k != "" {
+					blobsToDelete = append(blobsToDelete, k)
+				}
+			}
+			_ = rows.Err()
+			_ = rows.Close()
+		}
+
+		if _, err := tx.Exec(
+			`DELETE FROM cache_entries WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
+			pathLower, prefixStart, prefixEnd,
+		); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`DELETE FROM node_meta WHERE path_lower = ? OR (path_lower >= ? AND path_lower < ?)`,
+			pathLower, prefixStart, prefixEnd,
+		); err != nil {
+			return err
+		}
+
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		m.lastTouchedPath = ""
+		return nil
+	}(); err != nil {
 		return err
 	}
-	m.stateMu.Unlock()
 
 	m.scheduleBlobDeletes(blobsToDelete)
 	m.notifyChange(normPath)
@@ -1157,77 +1138,71 @@ func (m *Manager) QueueUtimens(ctx context.Context, p string, mtime int64) error
 		return err
 	}
 
-	m.stateMu.Lock()
-	ov, found, err := m.statLocked(normPath)
-	if err != nil {
-		m.stateMu.Unlock()
+	if err := func() error {
+		m.stateMu.Lock()
+		defer m.stateMu.Unlock()
+
+		ov, found, err := m.statLocked(normPath)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return os.ErrNotExist
+		}
+
+		pathLower := strings.ToLower(normPath)
+		parentLower := strings.ToLower(parentOfNormalized(normPath))
+		nowNS := time.Now().UnixNano()
+
+		tx, err := m.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		res, err := tx.Exec(
+			`INSERT INTO write_queue (op_type, path, new_path, payload_file, size, mtime, is_dir, status, created_at_ns)
+			 VALUES (?, ?, '', '', 0, ?, ?, 'pending', ?)`,
+			string(OpUtimens), normPath, mtime, boolToInt(ov.IsDir), nowNS,
+		)
+		if err != nil {
+			return err
+		}
+		opID, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+
+		var existingBlob, existingETag string
+		_ = tx.QueryRow(`SELECT blob_key, remote_etag FROM cache_entries WHERE path_lower = ?`, pathLower).Scan(&existingBlob, &existingETag)
+		if existingBlob == "" {
+			_ = tx.QueryRow(`SELECT blob_key FROM overlay_nodes WHERE path_lower = ?`, pathLower).Scan(&existingBlob)
+		}
+
+		if _, err := tx.Exec(`
+			INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?)
+			ON CONFLICT(path_lower) DO UPDATE SET
+				mtime=excluded.mtime, deleted=0, dirty=1, last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
+		`, pathLower, ov.Path, parentLower, baseName, boolToInt(ov.IsDir), ov.Size, mtime, ov.Ctime, existingBlob, opID, nowNS); err != nil {
+			return err
+		}
+
+		if _, err := tx.Exec(`UPDATE cache_entries SET mtime = ?, last_op_id = ? WHERE path_lower = ?`, mtime, opID, pathLower); err != nil {
+			return err
+		}
+
+		if _, err := tx.Exec(`
+			INSERT INTO node_meta (path_lower, path, mtime, etag) VALUES (?, ?, ?, ?)
+			ON CONFLICT(path_lower) DO UPDATE SET path=excluded.path, mtime=excluded.mtime, etag=excluded.etag
+		`, pathLower, ov.Path, mtime, existingETag); err != nil {
+			return err
+		}
+
+		return tx.Commit()
+	}(); err != nil {
 		return err
 	}
-	if !found {
-		m.stateMu.Unlock()
-		return os.ErrNotExist
-	}
-
-	pathLower := strings.ToLower(normPath)
-	parentLower := strings.ToLower(parentOfNormalized(normPath))
-	nowNS := time.Now().UnixNano()
-
-	tx, err := m.db.Begin()
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	defer tx.Rollback()
-
-	res, err := tx.Exec(
-		`INSERT INTO write_queue (op_type, path, new_path, payload_file, size, mtime, is_dir, status, created_at_ns)
-		 VALUES (?, ?, '', '', 0, ?, ?, 'pending', ?)`,
-		string(OpUtimens), normPath, mtime, boolToInt(ov.IsDir), nowNS,
-	)
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	opID, err := res.LastInsertId()
-	if err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-
-	var existingBlob, existingETag string
-	_ = tx.QueryRow(`SELECT blob_key, remote_etag FROM cache_entries WHERE path_lower = ?`, pathLower).Scan(&existingBlob, &existingETag)
-	if existingBlob == "" {
-		_ = tx.QueryRow(`SELECT blob_key FROM overlay_nodes WHERE path_lower = ?`, pathLower).Scan(&existingBlob)
-	}
-
-	if _, err := tx.Exec(`
-		INSERT INTO overlay_nodes (path_lower, path, parent_lower, name, is_dir, size, mtime, ctime, deleted, dirty, blob_key, last_op_id, updated_at_ns)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?)
-		ON CONFLICT(path_lower) DO UPDATE SET
-			mtime=excluded.mtime, deleted=0, dirty=1, last_op_id=excluded.last_op_id, updated_at_ns=excluded.updated_at_ns
-	`, pathLower, ov.Path, parentLower, baseName, boolToInt(ov.IsDir), ov.Size, mtime, ov.Ctime, existingBlob, opID, nowNS); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-
-	if _, err := tx.Exec(`UPDATE cache_entries SET mtime = ?, last_op_id = ? WHERE path_lower = ?`, mtime, opID, pathLower); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-
-	if _, err := tx.Exec(`
-		INSERT INTO node_meta (path_lower, path, mtime, etag) VALUES (?, ?, ?, ?)
-		ON CONFLICT(path_lower) DO UPDATE SET path=excluded.path, mtime=excluded.mtime, etag=excluded.etag
-	`, pathLower, ov.Path, mtime, existingETag); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-
-	if err := tx.Commit(); err != nil {
-		m.stateMu.Unlock()
-		return err
-	}
-	m.stateMu.Unlock()
 	m.notifyChange(normPath)
 
 	m.triggerFlush(ctx)
@@ -1289,54 +1264,53 @@ func (m *Manager) FlushQueue(ctx context.Context) error {
 		if err := m.backend.FlushPending(ctx); err != nil {
 			return err
 		}
-		m.stateMu.Lock()
-		tx, err := m.db.Begin()
-		if err != nil {
-			m.stateMu.Unlock()
-			return err
-		}
-		defer tx.Rollback()
-
 		var payloads []string
-		for _, w := range deferredWrites {
-			if _, err := tx.Exec(`DELETE FROM write_queue WHERE id = ?`, w.op.ID); err != nil {
-				m.stateMu.Unlock()
+		if err := func() error {
+			m.stateMu.Lock()
+			defer m.stateMu.Unlock()
+
+			tx, err := m.db.Begin()
+			if err != nil {
 				return err
 			}
-			if _, err := tx.Exec(`DELETE FROM overlay_nodes WHERE last_op_id <= ?`, w.op.ID); err != nil {
-				m.stateMu.Unlock()
-				return err
-			}
-			if w.remote != nil {
-				if _, err := tx.Exec(
-					`UPDATE cache_entries SET remote_node_id = ?, remote_etag = ?, dirty = 0 WHERE path_lower = ? AND last_op_id <= ?`,
-					w.remote.ID, w.remote.ETag, w.pathLower, w.op.ID,
-				); err != nil {
-					m.stateMu.Unlock()
+			defer tx.Rollback()
+
+			for _, w := range deferredWrites {
+				if _, err := tx.Exec(`DELETE FROM write_queue WHERE id = ?`, w.op.ID); err != nil {
 					return err
 				}
-				if _, err := tx.Exec(
-					`UPDATE node_meta SET etag = ? WHERE path_lower = ?`,
-					w.remote.ETag, w.pathLower,
-				); err != nil {
-					m.stateMu.Unlock()
+				if _, err := tx.Exec(`DELETE FROM overlay_nodes WHERE last_op_id <= ?`, w.op.ID); err != nil {
 					return err
 				}
+				if w.remote != nil {
+					if _, err := tx.Exec(
+						`UPDATE cache_entries SET remote_node_id = ?, remote_etag = ?, dirty = 0 WHERE path_lower = ? AND last_op_id <= ?`,
+						w.remote.ID, w.remote.ETag, w.pathLower, w.op.ID,
+					); err != nil {
+						return err
+					}
+					if _, err := tx.Exec(
+						`UPDATE node_meta SET etag = ? WHERE path_lower = ?`,
+						w.remote.ETag, w.pathLower,
+					); err != nil {
+						return err
+					}
+				}
+				if _, err := tx.Exec(`UPDATE cache_entries SET dirty = 0 WHERE dirty = 1 AND last_op_id <= ?`, w.op.ID); err != nil {
+					return err
+				}
+				if w.op.PayloadFile != "" {
+					payloads = append(payloads, w.op.PayloadFile)
+				}
 			}
-			if _, err := tx.Exec(`UPDATE cache_entries SET dirty = 0 WHERE dirty = 1 AND last_op_id <= ?`, w.op.ID); err != nil {
-				m.stateMu.Unlock()
+			if err := tx.Commit(); err != nil {
 				return err
 			}
-			if w.op.PayloadFile != "" {
-				payloads = append(payloads, w.op.PayloadFile)
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			m.stateMu.Unlock()
+			_ = m.evictToBudgetLocked()
+			return nil
+		}(); err != nil {
 			return err
 		}
-		_ = m.evictToBudgetLocked()
-		m.stateMu.Unlock()
 
 		changedPaths := make([]string, 0, len(deferredWrites))
 		for _, w := range deferredWrites {

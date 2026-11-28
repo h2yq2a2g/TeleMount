@@ -124,11 +124,23 @@ type Stats struct {
 	Packs          PackSummary `json:"packs"`
 }
 
+type BlobCheckRef struct {
+	TGMsgID      int
+	ExpectedSize int64
+	IsPack       bool
+	PackID       string
+}
+
 type Store struct {
 	mu         sync.RWMutex
 	dbPath     string
 	conn       *sql.DB
 	lastChange atomic.Int64
+	changeSeq  atomic.Int64
+
+	statsMu        sync.Mutex
+	cachedStats    *Stats
+	cachedStatsSeq int64
 }
 
 func Open(dbPath string) (*Store, error) {
@@ -143,8 +155,10 @@ func Open(dbPath string) (*Store, error) {
 		conn.Close()
 		return nil, err
 	}
+	_, _ = conn.Exec(`PRAGMA optimize;`)
 	s := &Store{dbPath: dbPath, conn: conn}
 	s.lastChange.Store(time.Now().Unix())
+	s.changeSeq.Store(1)
 	return s, nil
 }
 
@@ -312,6 +326,8 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.conn != nil {
+		_, _ = s.conn.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+		_, _ = s.conn.Exec(`PRAGMA optimize;`)
 		return s.conn.Close()
 	}
 	return nil
@@ -323,6 +339,130 @@ func (s *Store) LastChangeUnix() int64 {
 
 func (s *Store) markChanged() {
 	s.lastChange.Store(time.Now().Unix())
+	s.changeSeq.Add(1)
+}
+
+// SetNodeMtime persists a node's modification timestamp into SQLite so .tmdb backups preserve original mtimes.
+func (s *Store) SetNodeMtime(nodeID int64, mtime int64) error {
+	if mtime <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.conn.Exec(`UPDATE nodes SET updated_at = ? WHERE id = ? AND deleted_at IS NULL`, mtime, nodeID)
+	if err != nil {
+		return err
+	}
+	if aff, _ := res.RowsAffected(); aff == 0 {
+		return ErrNotFound
+	}
+	s.markChanged()
+	return nil
+}
+
+// QuickCheck runs SQLite's PRAGMA quick_check to verify database integrity before taking a backup.
+func (s *Store) QuickCheck() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return quickCheckConn(s.conn)
+}
+
+func quickCheckConn(conn *sql.DB) error {
+	rows, err := conn.Query(`PRAGMA quick_check;`)
+	if err != nil {
+		return fmt.Errorf("sqlite quick_check: %w", err)
+	}
+	defer rows.Close()
+	var results []string
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			return fmt.Errorf("scan quick_check: %w", err)
+		}
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate quick_check: %w", err)
+	}
+	if len(results) != 1 || !strings.EqualFold(results[0], "ok") {
+		return fmt.Errorf("sqlite integrity check failed: %s", strings.Join(results, "; "))
+	}
+	return nil
+}
+
+// CountUnflushedParts returns the number of file_parts with tg_msg_id = 0 (unflushed RAM pack rows).
+func (s *Store) CountUnflushedParts() (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int64
+	err := s.conn.QueryRow(`SELECT COUNT(*) FROM file_parts WHERE tg_msg_id = 0`).Scan(&n)
+	return n, err
+}
+
+// IsReferencedMsgID reports whether tgMsgID is still referenced by any live file part, pack, or upload checkpoint.
+func (s *Store) IsReferencedMsgID(tgMsgID int) (bool, error) {
+	if tgMsgID <= 0 {
+		return false, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var cnt int
+	err := s.conn.QueryRow(`
+		SELECT (SELECT COUNT(*) FROM file_parts WHERE tg_msg_id = ?)
+		     + (SELECT COUNT(*) FROM packs WHERE tg_msg_id = ?)
+		     + (SELECT COUNT(*) FROM upload_checkpoints WHERE tg_msg_id = ?)`,
+		tgMsgID, tgMsgID, tgMsgID,
+	).Scan(&cnt)
+	return cnt > 0, err
+}
+
+// ListReferencedBlobs returns every distinct Telegram blob message referenced by packs or standalone file_parts
+// together with its expected ciphertext size for integrity scrubbing.
+func (s *Store) ListReferencedBlobs() ([]BlobCheckRef, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var out []BlobCheckRef
+	seen := make(map[int]struct{})
+
+	pRows, err := s.conn.Query(`SELECT pack_id, tg_msg_id, total_size FROM packs WHERE tg_msg_id > 0 ORDER BY tg_msg_id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	for pRows.Next() {
+		var r BlobCheckRef
+		r.IsPack = true
+		if err := pRows.Scan(&r.PackID, &r.TGMsgID, &r.ExpectedSize); err != nil {
+			_ = pRows.Close()
+			return nil, err
+		}
+		if _, dup := seen[r.TGMsgID]; !dup {
+			seen[r.TGMsgID] = struct{}{}
+			out = append(out, r)
+		}
+	}
+	if err := pRows.Err(); err != nil {
+		_ = pRows.Close()
+		return nil, err
+	}
+	_ = pRows.Close()
+
+	fRows, err := s.conn.Query(`SELECT tg_msg_id, cipher_size FROM file_parts WHERE tg_msg_id > 0 AND pack_id = '' ORDER BY tg_msg_id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer fRows.Close()
+	for fRows.Next() {
+		var r BlobCheckRef
+		if err := fRows.Scan(&r.TGMsgID, &r.ExpectedSize); err != nil {
+			return nil, err
+		}
+		if _, dup := seen[r.TGMsgID]; !dup {
+			seen[r.TGMsgID] = struct{}{}
+			out = append(out, r)
+		}
+	}
+	return out, fRows.Err()
 }
 
 func newETag() string {
@@ -639,6 +779,10 @@ func (s *Store) UpsertFileWithParts(parentID int64, name string, size int64, mim
 				return nil, nil, err
 			}
 			candidateMsgIDs = append(candidateMsgIDs, mid)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, nil, err
 		}
 		rows.Close()
 
@@ -1143,6 +1287,10 @@ func (s *Store) EmptyTrash() ([]int, error) {
 		}
 		ids = append(ids, id)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
 	rows.Close()
 	if len(ids) == 0 {
 		return nil, nil
@@ -1325,6 +1473,10 @@ func (s *Store) PruneStaleUploadCheckpoints(maxAge time.Duration) ([]int, error)
 		}
 		candidates = append(candidates, mid)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
 	rows.Close()
 	if len(candidates) == 0 {
 		return nil, nil
@@ -1377,6 +1529,9 @@ func (s *Store) Search(query string, limit int) ([]NodeWithPath, error) {
 		}
 		nodes = append(nodes, *n)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	rows.Close()
 
 	res := make([]NodeWithPath, 0, len(nodes))
@@ -1398,6 +1553,15 @@ func escapeLike(q string) string {
 }
 
 func (s *Store) Stats() (*Stats, error) {
+	seq := s.changeSeq.Load()
+	s.statsMu.Lock()
+	if s.cachedStats != nil && s.cachedStatsSeq == seq {
+		cp := *s.cachedStats
+		s.statsMu.Unlock()
+		return &cp, nil
+	}
+	s.statsMu.Unlock()
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var st Stats
@@ -1443,6 +1607,14 @@ func (s *Store) Stats() (*Stats, error) {
 	if st.Packs.TotalPackBytes > st.Packs.LivePackBytes {
 		st.Packs.DeadPackBytes = st.Packs.TotalPackBytes - st.Packs.LivePackBytes
 	}
+
+	if s.changeSeq.Load() == seq {
+		cp := st
+		s.statsMu.Lock()
+		s.cachedStats = &cp
+		s.cachedStatsSeq = seq
+		s.statsMu.Unlock()
+	}
 	return &st, nil
 }
 
@@ -1461,6 +1633,9 @@ func (s *Store) GetSettings() (Settings, error) {
 			return Settings{}, err
 		}
 		kv[k] = v
+	}
+	if err := rows.Err(); err != nil {
+		return Settings{}, err
 	}
 	st := Settings{
 		PartSizeMB:        parseIntDefault(kv["part_size_mb"], 1024),
@@ -1505,6 +1680,11 @@ func (s *Store) SaveSettings(st Settings) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tx, err := s.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	pairs := map[string]string{
 		"part_size_mb":        strconv.Itoa(st.PartSizeMB),
 		"small_file_max_mb":   strconv.Itoa(st.SmallFileMaxMB),
@@ -1515,9 +1695,12 @@ func (s *Store) SaveSettings(st Settings) error {
 		"upload_threads":      strconv.Itoa(st.UploadThreads),
 	}
 	for k, v := range pairs {
-		if _, err := s.conn.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`, k, v); err != nil {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`, k, v); err != nil {
 			return err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	s.markChanged()
 	return nil
@@ -1525,8 +1708,8 @@ func (s *Store) SaveSettings(st Settings) error {
 
 func (s *Store) SetWebDAVCredentials(username, password string) error {
 	username = strings.TrimSpace(username)
-	if len(username) < 2 || len(password) < 4 {
-		return errors.New("webdav username must be >= 2 chars and password >= 4 chars")
+	if len(username) < 2 || len(password) < 8 {
+		return errors.New("webdav username must be >= 2 chars and password >= 8 chars")
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), 11)
 	if err != nil {
@@ -1534,10 +1717,18 @@ func (s *Store) SetWebDAVCredentials(username, password string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.conn.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('webdav_user', ?)`, username); err != nil {
+	tx, err := s.conn.Begin()
+	if err != nil {
 		return err
 	}
-	if _, err := s.conn.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('webdav_pass_hash', ?)`, string(hash)); err != nil {
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('webdav_user', ?)`, username); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('webdav_pass_hash', ?)`, string(hash)); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	s.markChanged()
@@ -1559,11 +1750,18 @@ func (s *Store) VerifyWebDAV(username, password string) bool {
 func (s *Store) RecordBackup(msgID int, at int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.conn.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('last_backup_at', ?)`, strconv.FormatInt(at, 10)); err != nil {
+	tx, err := s.conn.Begin()
+	if err != nil {
 		return err
 	}
-	_, err := s.conn.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('last_backup_msg_id', ?)`, strconv.Itoa(msgID))
-	return err
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('last_backup_at', ?)`, strconv.FormatInt(at, 10)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('last_backup_msg_id', ?)`, strconv.Itoa(msgID)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) SnapshotBytes(tmpDir string) ([]byte, error) {
@@ -1585,6 +1783,24 @@ func (s *Store) SnapshotBytes(tmpDir string) ([]byte, error) {
 	return os.ReadFile(snapPath)
 }
 
+func writeSyncedFile(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	return f.Close()
+}
+
 func (s *Store) RestoreFromBytes(raw []byte, tmpDir string) error {
 	if len(raw) < 100 || string(raw[:16]) != "SQLite format 3\x00" {
 		return errors.New("invalid sqlite backup image")
@@ -1592,18 +1808,29 @@ func (s *Store) RestoreFromBytes(raw []byte, tmpDir string) error {
 	if tmpDir == "" {
 		tmpDir = os.TempDir()
 	}
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		return err
+	}
 	verifyPath := filepath.Join(tmpDir, fmt.Sprintf("telemount-verify-%s.db", newETag()))
-	defer os.Remove(verifyPath)
-	if err := os.WriteFile(verifyPath, raw, 0o600); err != nil {
+	defer func() {
+		_ = os.Remove(verifyPath)
+		_ = os.Remove(verifyPath + "-wal")
+		_ = os.Remove(verifyPath + "-shm")
+	}()
+	if err := writeSyncedFile(verifyPath, raw, 0o600); err != nil {
 		return err
 	}
 	vconn, err := openConn(verifyPath)
 	if err != nil {
 		return fmt.Errorf("open candidate backup: %w", err)
 	}
+	if err := quickCheckConn(vconn); err != nil {
+		_ = vconn.Close()
+		return fmt.Errorf("candidate backup failed integrity check: %w", err)
+	}
 	var rootExists int
 	err = vconn.QueryRow(`SELECT COUNT(*) FROM nodes WHERE id = 1`).Scan(&rootExists)
-	vconn.Close()
+	_ = vconn.Close()
 	if err != nil || rootExists != 1 {
 		return errors.New("backup sqlite is missing telemount schema")
 	}
@@ -1611,29 +1838,51 @@ func (s *Store) RestoreFromBytes(raw []byte, tmpDir string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	stagePath := s.dbPath + ".restore"
+	if err := writeSyncedFile(stagePath, raw, 0o600); err != nil {
+		return err
+	}
+
 	if s.conn != nil {
+		_, _ = s.conn.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
 		_ = s.conn.Close()
 		s.conn = nil
 	}
 	_ = os.Remove(s.dbPath + "-wal")
 	_ = os.Remove(s.dbPath + "-shm")
 
-	stagePath := s.dbPath + ".restore"
-	if err := os.WriteFile(stagePath, raw, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(stagePath, s.dbPath); err != nil {
+	backupPath := s.dbPath + ".prev"
+	_ = os.Remove(backupPath)
+	hadPrev := os.Rename(s.dbPath, backupPath) == nil
+
+	rollbackPrev := func(origErr error) error {
 		_ = os.Remove(stagePath)
-		return err
+		_ = os.Remove(s.dbPath + "-wal")
+		_ = os.Remove(s.dbPath + "-shm")
+		if hadPrev {
+			_ = os.Remove(s.dbPath)
+			_ = os.Rename(backupPath, s.dbPath)
+		}
+		if prevConn, rerr := openConn(s.dbPath); rerr == nil {
+			s.conn = prevConn
+		}
+		return origErr
+	}
+
+	if err := os.Rename(stagePath, s.dbPath); err != nil {
+		return rollbackPrev(err)
 	}
 
 	conn, err := openConn(s.dbPath)
 	if err != nil {
-		return err
+		return rollbackPrev(err)
 	}
 	if err := migrate(conn); err != nil {
-		conn.Close()
-		return err
+		_ = conn.Close()
+		return rollbackPrev(err)
+	}
+	if hadPrev {
+		_ = os.Remove(backupPath)
 	}
 	s.conn = conn
 	s.markChanged()
@@ -1755,15 +2004,42 @@ func (s *Store) ReplicaCountsByAccount() (int64, map[string]int64, error) {
 	return total, counts, rows.Err()
 }
 
+// CountUnreplicatedMsgIDs returns how many referenced primary blobs are not yet replicated to accountID.
+func (s *Store) CountUnreplicatedMsgIDs(accountID string) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var cnt int64
+	err := s.conn.QueryRow(`
+		WITH all_msgs(mid) AS (
+			SELECT DISTINCT tg_msg_id FROM file_parts WHERE tg_msg_id > 0
+			UNION
+			SELECT DISTINCT tg_msg_id FROM packs WHERE tg_msg_id > 0
+		)
+		SELECT COUNT(*) FROM all_msgs m
+		LEFT JOIN blob_replicas br ON br.account_id = ? AND br.primary_msg_id = m.mid
+		WHERE br.replica_msg_id IS NULL`, accountID).Scan(&cnt)
+	return cnt, err
+}
+
 func (s *Store) DeleteAccountReplicas(accountID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, _ = s.conn.Exec(`DELETE FROM pending_replica_deletes WHERE account_id = ?`, accountID)
-	_, err := s.conn.Exec(`DELETE FROM blob_replicas WHERE account_id = ?`, accountID)
-	if err == nil {
-		s.markChanged()
+	tx, err := s.conn.Begin()
+	if err != nil {
+		return err
 	}
-	return err
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM pending_replica_deletes WHERE account_id = ?`, accountID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM blob_replicas WHERE account_id = ?`, accountID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.markChanged()
+	return nil
 }
 
 func (s *Store) PendingReplicaDeletes(accountID string) ([]int, error) {
@@ -1809,7 +2085,7 @@ func (s *Store) ClearPendingReplicaDeletes(accountID string, msgIDs []int) error
 func (s *Store) PromoteAccountReplicasToPrimary(accountID string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.remapReplicasLocked(`account_id = ?`, accountID)
+	return s.remapReplicasLocked(false, accountID)
 }
 
 // RemapChannelReplicasOnRestore remaps file_parts and packs when restoring a .tmdb backup directly from a Backup Channel.
@@ -1819,13 +2095,19 @@ func (s *Store) RemapChannelReplicasOnRestore(channelID int64) (int64, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.remapReplicasLocked(`channel_id = ?`, channelID)
+	return s.remapReplicasLocked(true, channelID)
 }
 
-func (s *Store) remapReplicasLocked(whereClause string, arg any) (int64, error) {
-	rows, err := s.conn.Query(`
-		SELECT account_id, primary_msg_id, replica_msg_id, tg_file_id, tg_access_hash, tg_file_ref, tg_dc_id
-		FROM blob_replicas WHERE `+whereClause, arg)
+func (s *Store) remapReplicasLocked(byChannel bool, arg any) (int64, error) {
+	var selectSQL, deleteSQL string
+	if byChannel {
+		selectSQL = `SELECT account_id, primary_msg_id, replica_msg_id, tg_file_id, tg_access_hash, tg_file_ref, tg_dc_id FROM blob_replicas WHERE channel_id = ?`
+		deleteSQL = `DELETE FROM blob_replicas WHERE channel_id = ?`
+	} else {
+		selectSQL = `SELECT account_id, primary_msg_id, replica_msg_id, tg_file_id, tg_access_hash, tg_file_ref, tg_dc_id FROM blob_replicas WHERE account_id = ?`
+		deleteSQL = `DELETE FROM blob_replicas WHERE account_id = ?`
+	}
+	rows, err := s.conn.Query(selectSQL, arg)
 	if err != nil {
 		return 0, err
 	}
@@ -1837,6 +2119,10 @@ func (s *Store) remapReplicasLocked(whereClause string, arg any) (int64, error) 
 			return 0, err
 		}
 		reps = append(reps, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
 	}
 	rows.Close()
 	if len(reps) == 0 {
@@ -1883,7 +2169,7 @@ func (s *Store) remapReplicasLocked(whereClause string, arg any) (int64, error) 
 	if _, err := tx.Exec(`UPDATE blob_replicas SET primary_msg_id = -(primary_msg_id - ?) WHERE primary_msg_id < ?`, negBase, negBase); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(`DELETE FROM blob_replicas WHERE `+whereClause, arg); err != nil {
+	if _, err := tx.Exec(deleteSQL, arg); err != nil {
 		return 0, err
 	}
 

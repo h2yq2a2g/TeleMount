@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -95,10 +97,17 @@ func (s *Server) handleStartBackupAccount(w http.ResponseWriter, r *http.Request
 	id := strings.TrimSpace(req.ID)
 	if id == "" {
 		id = newAccountID()
+	} else if !tg.IsValidAccountID(id) {
+		writeErr(w, http.StatusBadRequest, "invalid backup account id")
+		return
 	}
 
 	bm := s.engine.Pool().GetOrCreateManager(id)
-	if err := bm.Start(context.Background(), apiID, apiHash); err != nil {
+	if bm == nil {
+		writeErr(w, http.StatusBadRequest, "invalid backup account id")
+		return
+	}
+	if err := bm.Start(s.baseContext(), apiID, apiHash); err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -115,7 +124,7 @@ func (s *Server) handleBackupQRStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "backup session not found")
 		return
 	}
-	if err := bm.StartQRLogin(context.Background()); err != nil {
+	if err := bm.StartQRLogin(s.baseContext()); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -230,9 +239,11 @@ func (s *Server) handleFinalizeBackupAccount(w http.ResponseWriter, r *http.Requ
 
 	// Kick off retroactive zero-bandwidth sync of all existing blobs + fresh .tmdb DB backup!
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		ctx, cancel := context.WithTimeout(s.baseContext(), 30*time.Minute)
 		defer cancel()
-		_, _ = s.engine.SyncAllReplicas(ctx, id)
+		if _, err := s.engine.SyncAllReplicas(ctx, id); err != nil {
+			slog.Warn("initial backup account sync failed", "account_id", id, "err", err)
+		}
 	}()
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -257,15 +268,37 @@ func (s *Server) handleSyncAccounts(w http.ResponseWriter, r *http.Request) {
 // handlePromoteBackupAccount promotes a Backup Account (and its independent Private Channel) to become the new Primary Account.
 func (s *Server) handlePromoteBackupAccount(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !tg.IsValidAccountID(id) {
+		writeErr(w, http.StatusBadRequest, "invalid backup account id")
+		return
+	}
 	if _, ok := s.engine.State().GetBackupAccount(id); !ok {
 		writeErr(w, http.StatusNotFound, "backup account not found")
 		return
 	}
 
+	var req struct {
+		Force bool `json:"force"`
+	}
+	_ = readJSON(r, &req)
+	force := req.Force || r.URL.Query().Get("force") == "true"
+
+	if !force {
+		unrep, err := s.engine.Store().CountUnreplicatedMsgIDs(id)
+		if err != nil {
+			writeInternalErr(w, "count_unreplicated", err)
+			return
+		}
+		if unrep > 0 {
+			writeErr(w, http.StatusConflict, fmt.Sprintf("backup account %s is missing %d unreplicated blob(s); run Sync first or pass force=true", id, unrep))
+			return
+		}
+	}
+
 	// 1. Remap SQLite file_parts, packs, and remaining replica mappings to this backup account's message IDs.
 	remapped, err := s.engine.Store().PromoteAccountReplicasToPrimary(id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeInternalErr(w, "promote_remap", err)
 		return
 	}
 
@@ -275,7 +308,7 @@ func (s *Server) handlePromoteBackupAccount(w http.ResponseWriter, r *http.Reque
 
 	promoted, err := s.engine.State().PromoteBackupState(id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeInternalErr(w, "promote_state", err)
 		return
 	}
 
@@ -283,21 +316,25 @@ func (s *Server) handlePromoteBackupAccount(w http.ResponseWriter, r *http.Reque
 	s.engine.Cache().Clear()
 	snap := s.engine.State().Snapshot()
 	s.tgMgr.SetChannel(promoted.OwnChannelID, promoted.OwnChannelAccessHash)
-	if err := s.tgMgr.Start(context.Background(), snap.TGAPIID, snap.TGAPIHash); err != nil {
+	if err := s.tgMgr.Start(s.baseContext(), snap.TGAPIID, snap.TGAPIHash); err != nil {
 		writeErr(w, http.StatusBadGateway, "Promoted backup account but reconnect failed: "+err.Error())
 		return
 	}
 
 	// 4. Re-link any other remaining Backup Accounts (#2, #3...) to read from the newly promoted Primary Channel!
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(s.baseContext(), 2*time.Minute)
 		defer cancel()
 		for _, other := range s.engine.State().BackupAccounts() {
 			if bm, ok := s.engine.Pool().GetManager(other.ID); ok && bm.IsAuthorized() {
-				_, _ = storage.LinkBackupAccount(ctx, s.engine.State(), s.tgMgr, bm, other.ID, other.APIID, other.APIHash)
+				if _, err := storage.LinkBackupAccount(ctx, s.engine.State(), s.tgMgr, bm, other.ID, other.APIID, other.APIHash); err != nil {
+					slog.Warn("re-link remaining backup account failed", "account_id", other.ID, "err", err)
+				}
 			}
 		}
-		_, _ = s.engine.BackupDBToTelegram(ctx)
+		if _, err := s.engine.BackupDBToTelegram(ctx); err != nil {
+			slog.Warn("post-promote db backup failed", "err", err)
+		}
 	}()
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -309,6 +346,10 @@ func (s *Server) handlePromoteBackupAccount(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) handleDeleteBackupAccount(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !tg.IsValidAccountID(id) {
+		writeErr(w, http.StatusBadRequest, "invalid backup account id")
+		return
+	}
 	s.engine.Pool().Remove(r.Context(), id, true)
 	_ = s.engine.State().RemoveBackupAccount(id)
 	_ = s.engine.Store().DeleteAccountReplicas(id)

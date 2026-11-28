@@ -194,6 +194,7 @@ func runPlatform(
 	httpSrv := &http.Server{
 		Handler:           srv,
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	ipcToken := generateIPCToken()
@@ -303,6 +304,7 @@ func runHeadlessWindows(
 		Addr:              listenAddr,
 		Handler:           srv,
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
@@ -959,8 +961,12 @@ func (r *desktopRuntime) shutdownOnce() {
 		defer cancel()
 		_ = r.mountMgr.Unmount(shutCtx)
 		if r.engine.IsReady() {
-			_ = r.cache.FlushQueue(shutCtx)
-			_ = r.engine.Packer().FlushNow(shutCtx)
+			if err := r.cache.FlushQueue(shutCtx); err != nil {
+				log.Printf("flush disk queue on shutdown warning: %v", err)
+			}
+			if err := r.engine.Packer().FlushNow(shutCtx); err != nil {
+				log.Printf("flush pack on shutdown warning: %v", err)
+			}
 		}
 		_ = r.httpSrv.Shutdown(shutCtx)
 		r.appCancel()

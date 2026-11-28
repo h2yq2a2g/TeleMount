@@ -3,6 +3,7 @@ package web
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"runtime"
 	"strings"
@@ -13,8 +14,16 @@ import (
 )
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	stats, _ := s.engine.Store().Stats()
-	settings, _ := s.engine.Store().GetSettings()
+	stats, err := s.engine.Store().Stats()
+	if err != nil {
+		slog.Warn("dashboard stats query failed", "err", err)
+	}
+	settings, err := s.engine.Store().GetSettings()
+	if err != nil {
+		slog.Warn("dashboard settings query failed", "err", err)
+	}
+	unflushed, _ := s.engine.Store().CountUnflushedParts()
+	bgErr, bgErrAt := s.engine.LastBackgroundError()
 	snap := s.engine.State().Snapshot()
 
 	var mem runtime.MemStats
@@ -31,6 +40,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"mem_alloc_bytes": mem.Alloc,
 		"mem_sys_bytes":   mem.Sys,
 		"ready":           s.engine.IsReady(),
+		"unflushed_parts": unflushed,
+		"last_bg_error":   bgErr,
+		"last_bg_err_at":  bgErrAt,
 	}
 	if ctrl := s.desktop(); ctrl != nil {
 		resp["desktop"] = normalizeStatus(ctrl.Status())
@@ -41,7 +53,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	settings, err := s.engine.Store().GetSettings()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeInternalErr(w, "get_settings", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, settings)
@@ -207,6 +219,15 @@ func (s *Server) handleCleanOrphans(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
+}
+
+func (s *Server) handleVerifyVault(w http.ResponseWriter, r *http.Request) {
+	rep, err := s.engine.VerifyVault(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func (s *Server) handleRcloneConfig(w http.ResponseWriter, r *http.Request) {

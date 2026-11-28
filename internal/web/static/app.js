@@ -457,7 +457,7 @@ $('btn-dl-key').addEventListener('click', () => {
 
 $('btn-init-key').addEventListener('click', async () => {
   const passphrase = $('fresh-key-input').value;
-  if (passphrase.length < 4) return toast(t('keyTooShort'), 'err');
+  if (passphrase.length < 8) return toast(t('keyTooShort'), 'err');
   if (!$('chk-saved-key').checked) return toast(t('mustConfirmKey'), 'err');
   const btn = $('btn-init-key');
   btn.disabled = true;

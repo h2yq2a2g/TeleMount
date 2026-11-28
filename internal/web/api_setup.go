@@ -123,6 +123,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "setup admin first")
 		return
 	}
+	ip := remoteClientIP(r)
+	if s.loginFails.isBlocked(ip) {
+		writeErr(w, http.StatusTooManyRequests, "Too many failed login attempts; please wait a few minutes")
+		return
+	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -132,9 +137,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.engine.State().VerifyAdmin(strings.TrimSpace(req.Username), req.Password) {
+		s.loginFails.recordFailure(ip)
 		writeErr(w, http.StatusUnauthorized, "Invalid username or password")
 		return
 	}
+	s.loginFails.clear(ip)
 	s.setSessionCookie(w, r, strings.TrimSpace(req.Username))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
@@ -184,7 +191,7 @@ func (s *Server) handleTGConnect(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.tgMgr.Start(context.Background(), req.APIID, req.APIHash); err != nil {
+	if err := s.tgMgr.Start(s.baseContext(), req.APIID, req.APIHash); err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -200,7 +207,7 @@ func (s *Server) handleTGConnect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTGQRStart(w http.ResponseWriter, r *http.Request) {
-	if err := s.tgMgr.StartQRLogin(context.Background()); err != nil {
+	if err := s.tgMgr.StartQRLogin(s.baseContext()); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -410,8 +417,8 @@ func (s *Server) handleInitKey(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if len(req.Passphrase) < 4 {
-		writeErr(w, http.StatusBadRequest, "Encryption key must be at least 4 characters")
+	if len(req.Passphrase) < 8 {
+		writeErr(w, http.StatusBadRequest, "Encryption key must be at least 8 characters")
 		return
 	}
 	salt, err := crypto.NewSalt()
@@ -493,7 +500,7 @@ func (s *Server) handleSetupWebDAV(w http.ResponseWriter, r *http.Request) {
 	// Refresh DB backup so restored instances also keep WebDAV credentials/state.
 	if s.engine.IsReady() {
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(s.baseContext(), 30*time.Second)
 			defer cancel()
 			_, _ = s.engine.BackupDBToTelegram(ctx)
 		}()

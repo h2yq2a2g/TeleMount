@@ -303,7 +303,7 @@ func TestDesktopSetupWizardSkipsWebDAVAndDisablesDAVRoute(t *testing.T) {
 	if err := st.SetChannel(123456, 789, "Vault"); err != nil {
 		t.Fatal(err)
 	}
-	resp, err := client.Post(ts.URL+"/api/setup/key/init", "application/json", strings.NewReader(`{"passphrase":"secret"}`))
+	resp, err := client.Post(ts.URL+"/api/setup/key/init", "application/json", strings.NewReader(`{"passphrase":"secretpass123"}`))
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("init key failed: %v", err)
 	}

@@ -1,9 +1,12 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"io/fs"
+	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -19,12 +22,61 @@ var staticFS embed.FS
 
 const sessionCookieName = "tm_session"
 
+type loginFailTracker struct {
+	mu      sync.Mutex
+	entries map[string][]time.Time
+}
+
+func (l *loginFailTracker) isBlocked(ip string) bool {
+	cutoff := time.Now().Add(-5 * time.Minute)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	kept := l.entries[ip][:0]
+	for _, ts := range l.entries[ip] {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	if len(kept) == 0 {
+		delete(l.entries, ip)
+		return false
+	}
+	l.entries[ip] = kept
+	return len(kept) >= 10
+}
+
+func (l *loginFailTracker) recordFailure(ip string) {
+	l.mu.Lock()
+	if l.entries == nil {
+		l.entries = make(map[string][]time.Time)
+	}
+	l.entries[ip] = append(l.entries[ip], time.Now())
+	l.mu.Unlock()
+}
+
+func (l *loginFailTracker) clear(ip string) {
+	l.mu.Lock()
+	delete(l.entries, ip)
+	l.mu.Unlock()
+}
+
+func remoteClientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 type Server struct {
 	engine          *storage.Engine
 	tgMgr           *tg.Manager
 	dav             *dav.Handler
 	startedAt       time.Time
 	mux             *http.ServeMux
+	appCtxMu        sync.RWMutex
+	appCtx          context.Context
+	loginFails      loginFailTracker
 	desktopMu       sync.RWMutex
 	desktopCtrl     DesktopController
 	desktopIPCToken string
@@ -37,9 +89,30 @@ func NewServer(engine *storage.Engine, tgMgr *tg.Manager) *Server {
 		dav:       dav.NewHandler("/dav", engine),
 		startedAt: time.Now(),
 		mux:       http.NewServeMux(),
+		appCtx:    context.Background(),
 	}
 	s.registerRoutes()
 	return s
+}
+
+// SetContext binds the application lifecycle context so Telegram sessions started via Web UI cancel cleanly on shutdown.
+func (s *Server) SetContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.appCtxMu.Lock()
+	s.appCtx = ctx
+	s.appCtxMu.Unlock()
+}
+
+func (s *Server) baseContext() context.Context {
+	s.appCtxMu.RLock()
+	ctx := s.appCtx
+	s.appCtxMu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +125,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.dav.ServeHTTP(w, r)
 		return
 	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "same-origin")
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -95,6 +171,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/ops/restore", s.requireAdmin(s.handleRestoreBackup))
 	s.mux.HandleFunc("GET /api/ops/orphans", s.requireReady(s.handleScanOrphans))
 	s.mux.HandleFunc("POST /api/ops/orphans/clean", s.requireReady(s.handleCleanOrphans))
+	s.mux.HandleFunc("POST /api/ops/verify", s.requireReady(s.handleVerifyVault))
 	s.mux.HandleFunc("GET /api/ops/rclone-config", s.requireAdmin(s.handleRcloneConfig))
 
 	// Desktop Virtual Drive & Disk Cache Controls (admin-protected)
@@ -202,4 +279,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func writeInternalErr(w http.ResponseWriter, op string, err error) {
+	slog.Error("http handler internal error", "op", op, "err", err)
+	writeErr(w, http.StatusInternalServerError, "internal server error")
 }

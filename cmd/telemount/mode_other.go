@@ -45,6 +45,7 @@ func runPlatform(
 		Addr:              listenAddr,
 		Handler:           srv,
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {

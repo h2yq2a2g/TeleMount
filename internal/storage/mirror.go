@@ -4,14 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
-	"sync"
 	"time"
 
 	"telemount/internal/db"
 	"telemount/internal/state"
 	"telemount/internal/tg"
 )
+
+type batchForwarder interface {
+	ForwardCopyDocsBatch(ctx context.Context, srcChannelID, srcAccessHash int64, srcMsgIDs []int) (map[int]*tg.UploadedDoc, error)
+}
 
 type SyncReport struct {
 	SyncedBlobs int            `json:"synced_blobs"`
@@ -24,11 +28,13 @@ func (e *Engine) MirrorMsgAsync(primaryMsgID int, isDBBackup bool) {
 	if primaryMsgID <= 0 || len(e.state.BackupAccounts()) == 0 {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	e.spawnBg(func(bgCtx context.Context) {
+		ctx, cancel := context.WithTimeout(bgCtx, 2*time.Minute)
 		defer cancel()
-		_ = e.MirrorMsg(ctx, primaryMsgID, isDBBackup)
-	}()
+		if err := e.MirrorMsg(ctx, primaryMsgID, isDBBackup); err != nil {
+			e.recordBgError("mirror_msg", err)
+		}
+	})
 }
 
 // MirrorMsg performs zero-bandwidth server-side copy (DropAuthor: true) of primaryMsgID into every configured backup account's private channel.
@@ -74,6 +80,11 @@ func (e *Engine) MirrorMsg(ctx context.Context, primaryMsgID int, isDBBackup boo
 		}
 
 		if !isDBBackup {
+			// Guard against fast delete/overwrite race: if primary blob was already unreferenced, clean up replica immediately.
+			if stillRef, rerr := e.store.IsReferencedMsgID(primaryMsgID); rerr == nil && !stillRef {
+				_ = backend.DeleteMessages(ctx, []int{repDoc.MsgID})
+				continue
+			}
 			if err := e.store.UpsertBlobReplica(db.BlobReplica{
 				AccountID:    acc.ID,
 				ChannelID:    acc.OwnChannelID,
@@ -87,28 +98,43 @@ func (e *Engine) MirrorMsg(ctx context.Context, primaryMsgID int, isDBBackup boo
 				firstErr = err
 			}
 		} else {
-			// Keep only the latest DB backup on the backup account's own channel too.
-			if docs, err := backend.ListChannelDocs(ctx, DBBackupPrefix, 30); err == nil {
-				sort.Slice(docs, func(i, j int) bool { return docs[i].MsgID > docs[j].MsgID })
-				var oldIDs []int
-				kept := 1
-				for _, d := range docs {
-					if d.MsgID == repDoc.MsgID {
-						continue
-					}
-					if kept < DBBackupKeepCount {
-						kept++
-						continue
-					}
-					oldIDs = append(oldIDs, d.MsgID)
-				}
-				if len(oldIDs) > 0 {
-					_ = backend.DeleteMessages(ctx, oldIDs)
-				}
-			}
+			pruneOldBackupDocs(ctx, backend, repDoc.MsgID)
 		}
 	}
 	return firstErr
+}
+
+func pruneOldBackupDocs(ctx context.Context, backend tg.Backend, newestMsgID int) {
+	docs, err := backend.ListChannelDocs(ctx, DBBackupPrefix, 30)
+	if err != nil {
+		slog.Warn("list backup channel db backups failed", "err", err)
+		return
+	}
+	sort.Slice(docs, func(i, j int) bool { return docs[i].MsgID > docs[j].MsgID })
+	var oldIDs []int
+	kept := 1
+	for _, d := range docs {
+		if d.MsgID == newestMsgID {
+			continue
+		}
+		if kept < DBBackupKeepCount {
+			kept++
+			continue
+		}
+		oldIDs = append(oldIDs, d.MsgID)
+	}
+	if len(oldIDs) > 0 {
+		if err := backend.DeleteMessages(ctx, oldIDs); err != nil {
+			slog.Warn("prune old backup channel db backups failed", "count", len(oldIDs), "err", err)
+		}
+	}
+}
+
+func isFatalMirrorErr(err error) bool {
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, tg.ErrNotAuthorized) ||
+		errors.Is(err, tg.ErrNotConnected)
 }
 
 // SyncAllReplicas retroactively server-side copies all unreplicated packs/parts (and fresh .tmdb backup)
@@ -118,7 +144,9 @@ func (e *Engine) SyncAllReplicas(ctx context.Context, targetAccountID string) (*
 	defer e.syncMu.Unlock()
 
 	if e.tg.IsAuthorized() {
-		_ = e.packer.FlushNow(ctx)
+		if err := e.packer.FlushNow(ctx); err != nil {
+			slog.Warn("flush pack before replica sync failed", "err", err)
+		}
 	}
 
 	primarySnap := e.state.Snapshot()
@@ -130,6 +158,7 @@ func (e *Engine) SyncAllReplicas(ctx context.Context, targetAccountID string) (*
 		ByAccount: make(map[string]int),
 	}
 
+	needDBBackup := false
 	for _, acc := range primarySnap.BackupAccounts {
 		if targetAccountID != "" && acc.ID != targetAccountID {
 			continue
@@ -156,14 +185,11 @@ func (e *Engine) SyncAllReplicas(ctx context.Context, targetAccountID string) (*
 			rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", acc.ID, err))
 			continue
 		}
-		for _, mid := range missing {
-			if ctx.Err() != nil {
-				return rep, ctx.Err()
-			}
-			doc, err := backend.ForwardCopyDoc(ctx, acc.SourceChannelID, acc.SourceChannelAccessHash, mid)
-			if err != nil {
-				rep.Errors = append(rep.Errors, fmt.Sprintf("%s msg#%d: %v", acc.ID, mid, err))
-				break
+
+		recordCopied := func(mid int, doc *tg.UploadedDoc) error {
+			if stillRef, rerr := e.store.IsReferencedMsgID(mid); rerr == nil && !stillRef {
+				_ = backend.DeleteMessages(ctx, []int{doc.MsgID})
+				return nil
 			}
 			if err := e.store.UpsertBlobReplica(db.BlobReplica{
 				AccountID:    acc.ID,
@@ -175,17 +201,88 @@ func (e *Engine) SyncAllReplicas(ctx context.Context, targetAccountID string) (*
 				TGFileRef:    doc.FileRef,
 				TGDCID:       doc.DCID,
 			}); err != nil {
-				rep.Errors = append(rep.Errors, err.Error())
-				break
+				return err
 			}
 			rep.SyncedBlobs++
 			rep.ByAccount[acc.ID]++
+			return nil
+		}
+
+		// Use batch forward (50 msgs/RPC) when supported, falling back per-message on partial errors so
+		// one bad/missing message never blocks newer blobs from replicating.
+		bf, hasBatch := backend.(batchForwarder)
+		const batchSize = 50
+		for i := 0; i < len(missing); {
+			if ctx.Err() != nil {
+				return rep, ctx.Err()
+			}
+			if hasBatch && len(missing)-i > 1 {
+				end := i + batchSize
+				if end > len(missing) {
+					end = len(missing)
+				}
+				chunk := missing[i:end]
+				copiedMap, berr := bf.ForwardCopyDocsBatch(ctx, acc.SourceChannelID, acc.SourceChannelAccessHash, chunk)
+				if berr == nil && len(copiedMap) > 0 {
+					var unmatched []int
+					for _, mid := range chunk {
+						if doc, ok := copiedMap[mid]; ok {
+							if uerr := recordCopied(mid, doc); uerr != nil {
+								rep.Errors = append(rep.Errors, uerr.Error())
+							}
+						} else {
+							unmatched = append(unmatched, mid)
+						}
+					}
+					for _, mid := range unmatched {
+						doc, serr := backend.ForwardCopyDoc(ctx, acc.SourceChannelID, acc.SourceChannelAccessHash, mid)
+						if serr != nil {
+							rep.Errors = append(rep.Errors, fmt.Sprintf("%s msg#%d: %v", acc.ID, mid, serr))
+							if isFatalMirrorErr(serr) {
+								i = len(missing)
+								break
+							}
+							continue
+						}
+						if uerr := recordCopied(mid, doc); uerr != nil {
+							rep.Errors = append(rep.Errors, uerr.Error())
+						}
+					}
+					i = end
+					continue
+				}
+				if berr != nil && isFatalMirrorErr(berr) {
+					rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", acc.ID, berr))
+					break
+				}
+			}
+
+			mid := missing[i]
+			i++
+			doc, err := backend.ForwardCopyDoc(ctx, acc.SourceChannelID, acc.SourceChannelAccessHash, mid)
+			if err != nil {
+				rep.Errors = append(rep.Errors, fmt.Sprintf("%s msg#%d: %v", acc.ID, mid, err))
+				if isFatalMirrorErr(err) {
+					break
+				}
+				continue
+			}
+			if err := recordCopied(mid, doc); err != nil {
+				rep.Errors = append(rep.Errors, err.Error())
+			}
+		}
+
+		// Ensure this backup channel also holds at least one .tmdb DB backup even if no new blobs were synced.
+		if docs, derr := backend.ListChannelDocs(ctx, DBBackupPrefix, 1); derr == nil && len(docs) == 0 {
+			needDBBackup = true
 		}
 	}
 
 	// Push an updated .tmdb backup (which includes the new blob_replicas rows) so every backup channel has a self-contained recovery snapshot.
-	if rep.SyncedBlobs > 0 && e.tg.IsAuthorized() {
-		_, _ = e.BackupDBToTelegram(ctx)
+	if (rep.SyncedBlobs > 0 || needDBBackup) && e.tg.IsAuthorized() {
+		if _, err := e.BackupDBToTelegram(ctx); err != nil {
+			rep.Errors = append(rep.Errors, fmt.Sprintf("db backup: %v", err))
+		}
 	}
 	return rep, nil
 }
@@ -208,7 +305,7 @@ func (e *Engine) FlushPendingReplicaDeletes(ctx context.Context) {
 
 // fetchChunkWithFailover tries the Primary account first, and transparently falls back to any healthy Backup Account replica
 // if the Primary account is offline, banned, or returns an error.
-func (e *Engine) fetchChunkWithFailover(ctx context.Context, part *db.FilePart, offset int64) ([]byte, error) {
+func (e *Engine) fetchChunkWithFailover(ctx context.Context, part db.FilePart, offset int64) ([]byte, error) {
 	var primaryErr error
 	if e.tg.IsAuthorized() {
 		ref := tg.DocRef{
@@ -221,7 +318,6 @@ func (e *Engine) fetchChunkWithFailover(ctx context.Context, part *db.FilePart, 
 		data, err := e.tg.FetchChunk(ctx, ref, offset, tg.TGChunkSize)
 		if errors.Is(err, tg.ErrFileRefExpired) {
 			if fresh, rerr := e.tg.RefreshFileRef(ctx, part.TGMsgID); rerr == nil {
-				part.TGFileRef = fresh
 				_ = e.store.UpdateMsgFileRef(part.TGMsgID, fresh)
 				ref.FileRef = fresh
 				data, err = e.tg.FetchChunk(ctx, ref, offset, tg.TGChunkSize)
@@ -344,6 +440,3 @@ func LinkBackupAccount(ctx context.Context, st *state.Manager, primaryMgr *tg.Ma
 	}
 	return &cfg, nil
 }
-
-// Ensure sync unused import guard if refactored.
-var _ = sync.Mutex{}

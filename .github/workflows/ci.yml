@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+jobs:
+  test-linux-race:
+    name: Linux Vet & Race Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Unit tests with race detector
+        run: go test -race -count=1 ./...
+
+  test-windows:
+    name: Windows Vet, Unit & E2E Tests
+    runs-on: windows-latest
+    env:
+      # cgofuse uses pure-Go syscall backend on Windows only when CGO_ENABLED=0.
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Vet
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          go vet ./...
+          go vet -tags e2e ./e2e/...
+      - name: Unit & E2E tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          go test -count=1 ./...
+          go test -tags e2e -count=1 ./e2e/...

@@ -23,7 +23,24 @@ func NewPool(dataDir string) *Pool {
 	}
 }
 
+// IsValidAccountID checks that an account ID is a safe filename token (alphanumeric, '-', '_', 1..32 chars).
+func IsValidAccountID(id string) bool {
+	if len(id) == 0 || len(id) > 32 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 func (p *Pool) GetOrCreateManager(id string) *Manager {
+	if !IsValidAccountID(id) {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if m, ok := p.managers[id]; ok {

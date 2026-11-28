@@ -79,10 +79,10 @@ func main() {
 	}
 
 	engine := storage.NewEngine(store, st, tgMgr, tmpDir)
+	defer engine.Close()
 	defer engine.Pool().StopAll()
 
 	for _, acc := range snap.BackupAccounts {
-		acc := acc
 		apiID, apiHash := acc.APIID, acc.APIHash
 		if apiID <= 0 || apiHash == "" {
 			apiID, apiHash = snap.TGAPIID, snap.TGAPIHash
@@ -91,6 +91,9 @@ func main() {
 			continue
 		}
 		bm := engine.Pool().GetOrCreateManager(acc.ID)
+		if bm == nil {
+			continue
+		}
 		if acc.OwnChannelID != 0 {
 			bm.SetChannel(acc.OwnChannelID, acc.OwnChannelAccessHash)
 		}
@@ -103,6 +106,7 @@ func main() {
 
 	engine.StartBackgroundTasks(appCtx)
 	srv := web.NewServer(engine, tgMgr)
+	srv.SetContext(appCtx)
 
 	runPlatform(appCtx, appCancel, dataDir, listenAddr, *headless, *minimized, store, st, tgMgr, engine, srv)
 }

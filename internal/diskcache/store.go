@@ -461,6 +461,10 @@ func (m *Manager) cleanupOnOpen() error {
 			missingClean = append(missingClean, pLower)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
 	_ = rows.Close()
 	if len(missingClean) > 0 {
 		tx, err := m.db.Begin()

@@ -188,6 +188,18 @@ func (m *mockTG) DownloadSmallDoc(_ context.Context, doc tg.ChannelDoc) ([]byte,
 	return append([]byte(nil), m.docs[doc.MsgID].data...), nil
 }
 
+func (m *mockTG) CheckMessages(_ context.Context, msgIDs []int) (map[int]int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[int]int64, len(msgIDs))
+	for _, id := range msgIDs {
+		if d, ok := m.docs[id]; ok {
+			out[id] = int64(len(d.data))
+		}
+	}
+	return out, nil
+}
+
 func TestEngineMultiPartUploadSeekCacheAndBackupRestore(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -633,7 +645,7 @@ func TestFileReaderSequentialReadAheadAndCleanClose(t *testing.T) {
 	}
 }
 
-func TestDBBackupKeepsOnlyLatestSingleBackup(t *testing.T) {
+func TestDBBackupRetainsRollingBackups(t *testing.T) {
 	dir := t.TempDir()
 	store, err := db.Open(filepath.Join(dir, "test.db"))
 	if err != nil {
@@ -649,26 +661,222 @@ func TestDBBackupKeepsOnlyLatestSingleBackup(t *testing.T) {
 	key := crypto.DeriveMasterKey("secret-pass", salt)
 	_ = st.SetAdmin("admin", "pass1234")
 	_ = st.SetMasterKey(key, salt)
-	_ = st.SetChannel(1001, 2002, "SingleBackupChan")
+	_ = st.SetChannel(1001, 2002, "RollingBackupChan")
 	mock := newMockTG()
 	eng := NewEngine(store, st, mock, filepath.Join(dir, "tmp"))
+	defer eng.Close()
 
 	ctx := context.Background()
-	var lastDoc *tg.UploadedDoc
-	for i := 0; i < 3; i++ {
+	var uploadedIDs []int
+	for i := 0; i < DBBackupKeepCount+2; i++ {
 		d, err := eng.BackupDBToTelegram(ctx)
 		if err != nil {
 			t.Fatalf("BackupDBToTelegram #%d: %v", i+1, err)
 		}
-		lastDoc = d
+		uploadedIDs = append(uploadedIDs, d.MsgID)
 	}
 
 	backups, err := eng.ListChannelBackups(ctx)
 	if err != nil {
 		t.Fatalf("ListChannelBackups: %v", err)
 	}
-	if len(backups) != 1 || backups[0].MsgID != lastDoc.MsgID {
-		t.Fatalf("expected exactly 1 latest DB backup (msg #%d), got %+v", lastDoc.MsgID, backups)
+	if len(backups) != DBBackupKeepCount {
+		t.Fatalf("expected %d rolling DB backups, got %d (%+v)", DBBackupKeepCount, len(backups), backups)
+	}
+	wantLatest := uploadedIDs[len(uploadedIDs)-1]
+	if backups[0].MsgID != wantLatest {
+		t.Fatalf("expected newest backup msg #%d first, got #%d", wantLatest, backups[0].MsgID)
+	}
+}
+
+func TestBackupDBFailClosedWhenPackFlushFails(t *testing.T) {
+	dir := t.TempDir()
+	store, err := db.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	st, _ := state.Load(dir)
+	salt, _ := crypto.NewSalt()
+	_ = st.SetAdmin("admin", "pass1234")
+	_ = st.SetMasterKey(crypto.DeriveMasterKey("secret-pass", salt), salt)
+	_ = st.SetChannel(1001, 2002, "FailClosedChan")
+
+	cfg, _ := store.GetSettings()
+	cfg.PackIdleSec = 300
+	_ = store.SaveSettings(cfg)
+
+	mock := newMockTG()
+	eng := NewEngine(store, st, mock, filepath.Join(dir, "tmp"))
+	defer eng.Close()
+
+	ctx := context.Background()
+	data := bytes.Repeat([]byte("staged-small-"), 512)
+	if _, err := eng.UploadFile(ctx, db.RootID, "staged.txt", "text/plain", bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+
+	// Next upload (pack flush inside BackupDBToTelegram) fails -> BackupDBToTelegram MUST fail closed!
+	mock.mu.Lock()
+	mock.failUploadAt = mock.uploadCalls + 1
+	mock.mu.Unlock()
+
+	if _, err := eng.BackupDBToTelegram(ctx); err == nil {
+		t.Fatal("expected BackupDBToTelegram to fail closed when staged pack flush fails")
+	}
+	backups, err := eng.ListChannelBackups(ctx)
+	if err != nil {
+		t.Fatalf("ListChannelBackups: %v", err)
+	}
+	if len(backups) != 0 {
+		t.Fatalf("expected 0 DB backups uploaded after pack flush failure, got %d", len(backups))
+	}
+}
+
+func TestVerifyVaultAndSyncContinuesPastMissingMessage(t *testing.T) {
+	dir := t.TempDir()
+	store, err := db.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	st, _ := state.Load(dir)
+	salt, _ := crypto.NewSalt()
+	_ = st.SetAdmin("admin", "pass1234")
+	_ = st.SetMasterKey(crypto.DeriveMasterKey("secret-pass", salt), salt)
+	_ = st.SetChannel(1001, 2002, "PrimaryChan")
+
+	cfg, _ := store.GetSettings()
+	cfg.SmallFileMaxMB = 0 // upload each file as its own message
+	_ = store.SaveSettings(cfg)
+
+	primaryTG := newMockTG()
+	eng := NewEngine(store, st, primaryTG, filepath.Join(dir, "tmp"))
+	defer eng.Close()
+
+	ctx := context.Background()
+	n1, err := eng.UploadFile(ctx, db.RootID, "f1.bin", "application/octet-stream", bytes.NewReader([]byte("file-one-content")), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2, err := eng.UploadFile(ctx, db.RootID, "f2.bin", "application/octet-stream", bytes.NewReader([]byte("file-two-content")), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Healthy vault scrub.
+	vrep, err := eng.VerifyVault(ctx)
+	if err != nil {
+		t.Fatalf("VerifyVault: %v", err)
+	}
+	if !vrep.SQLiteOK || vrep.CheckedBlobs != 2 || vrep.HealthyBlobs != 2 || len(vrep.MissingOnPrimary) != 0 {
+		t.Fatalf("unexpected healthy VerifyReport: %+v", vrep)
+	}
+
+	// Simulate message 1 vanishing on Primary before SyncAllReplicas runs.
+	p1, _ := store.GetFileParts(n1.ID)
+	p2, _ := store.GetFileParts(n2.ID)
+	_ = primaryTG.DeleteMessages(ctx, []int{p1[0].TGMsgID})
+
+	backupTG := newMockTG()
+	backupTG.sourceRef = primaryTG
+	eng.Pool().SetTestBackend("acc-bak1", backupTG)
+	_ = st.UpsertBackupAccount(state.BackupAccountConfig{
+		ID:                      "acc-bak1",
+		OwnChannelID:            9009,
+		OwnChannelAccessHash:    8888,
+		OwnChannelTitle:         "BackupChan",
+		SourceChannelID:         1001,
+		SourceChannelAccessHash: 7777,
+	})
+
+	srep, err := eng.SyncAllReplicas(ctx, "acc-bak1")
+	if err != nil {
+		t.Fatalf("SyncAllReplicas: %v", err)
+	}
+	if srep.SyncedBlobs != 1 || len(srep.Errors) == 0 {
+		t.Fatalf("expected SyncAllReplicas to skip missing msg #%d and still replicate msg #%d, got %+v", p1[0].TGMsgID, p2[0].TGMsgID, srep)
+	}
+
+	// Delete message 2 on primary as well -> VerifyVault must report 2 missing, with msg 2 marked recoverable!
+	_ = primaryTG.DeleteMessages(ctx, []int{p2[0].TGMsgID})
+	vrep2, err := eng.VerifyVault(ctx)
+	if err != nil {
+		t.Fatalf("VerifyVault after loss: %v", err)
+	}
+	if len(vrep2.MissingOnPrimary) != 2 || len(vrep2.RecoverableBlobs) != 1 || vrep2.RecoverableBlobs[0] != p2[0].TGMsgID {
+		t.Fatalf("unexpected degraded VerifyReport: %+v", vrep2)
+	}
+}
+
+func TestChunkCacheGetOrFetchCancellationIsolation(t *testing.T) {
+	t.Parallel()
+	cache := NewChunkCache(1024 * 1024)
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var calls int
+	var mu sync.Mutex
+
+	fetch := func() ([]byte, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		close(started)
+		<-release
+		return []byte("chunk-bytes"), nil
+	}
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	errChA := make(chan error, 1)
+	go func() {
+		_, err := cache.GetOrFetch(ctxA, 7, 0, fetch)
+		errChA <- err
+	}()
+	<-started
+
+	resChB := make(chan []byte, 1)
+	errChB := make(chan error, 1)
+	go func() {
+		b, err := cache.GetOrFetch(context.Background(), 7, 0, fetch)
+		resChB <- b
+		errChB <- err
+	}()
+	time.Sleep(15 * time.Millisecond)
+
+	// Cancelling waiter A must unblock A immediately without poisoning waiter B.
+	cancelA()
+	if err := <-errChA; !errors.Is(err, context.Canceled) {
+		t.Fatalf("waiter A err = %v, want context.Canceled", err)
+	}
+	close(release)
+	if err := <-errChB; err != nil {
+		t.Fatalf("waiter B err = %v, want nil", err)
+	}
+	if got := string(<-resChB); got != "chunk-bytes" {
+		t.Fatalf("waiter B data = %q, want %q", got, "chunk-bytes")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("expected 1 singleflight fetch, got %d", calls)
+	}
+}
+
+func TestResumableUploadKeyDetectsMiddleChange(t *testing.T) {
+	t.Parallel()
+	a := bytes.Repeat([]byte("A"), 512*1024)
+	b := append([]byte(nil), a...)
+	b[len(b)/2] = 'Z' // same head, tail, and length; middle differs
+
+	k1, ok1 := computeResumableUploadKey(1, "disk.img", int64(len(a)), 10<<20, bytes.NewReader(a))
+	k2, ok2 := computeResumableUploadKey(1, "disk.img", int64(len(b)), 10<<20, bytes.NewReader(b))
+	if !ok1 || !ok2 {
+		t.Fatalf("expected keys computed: ok1=%v ok2=%v", ok1, ok2)
+	}
+	if k1 == k2 {
+		t.Fatal("expected upload key to differ when middle of file changes")
 	}
 }
 

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"container/list"
+	"context"
 	"sync"
 )
 
@@ -62,9 +63,11 @@ func (c *ChunkCache) Get(msgID int, chunkIdx int64) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.items[key]; ok {
-		c.ll.MoveToFront(el)
-		c.hits++
-		return el.Value.(*cacheEntry).data, true
+		if ent, ok := el.Value.(*cacheEntry); ok {
+			c.ll.MoveToFront(el)
+			c.hits++
+			return ent.data, true
+		}
 	}
 	c.misses++
 	return nil, false
@@ -82,13 +85,14 @@ func (c *ChunkCache) Put(msgID int, chunkIdx int64, data []byte) {
 		return
 	}
 	if el, ok := c.items[key]; ok {
-		ent := el.Value.(*cacheEntry)
-		c.used -= int64(len(ent.data))
-		ent.data = data
-		c.used += size
-		c.ll.MoveToFront(el)
-		c.evictLocked()
-		return
+		if ent, ok := el.Value.(*cacheEntry); ok {
+			c.used -= int64(len(ent.data))
+			ent.data = data
+			c.used += size
+			c.ll.MoveToFront(el)
+			c.evictLocked()
+			return
+		}
 	}
 	el := c.ll.PushFront(&cacheEntry{key: key, data: data})
 	c.items[key] = el
@@ -97,37 +101,44 @@ func (c *ChunkCache) Put(msgID int, chunkIdx int64, data []byte) {
 }
 
 // GetOrFetch checks the RAM cache first, deduplicates concurrent fetches for the same chunk,
-// caches the result on success, and returns the chunk bytes.
-func (c *ChunkCache) GetOrFetch(msgID int, chunkIdx int64, fetch func() ([]byte, error)) ([]byte, error) {
+// caches the result on success, and respects ctx cancellation while waiting without letting
+// one canceled waiter poison other concurrent waiters sharing the same inflight fetch.
+func (c *ChunkCache) GetOrFetch(ctx context.Context, msgID int, chunkIdx int64, fetch func() ([]byte, error)) ([]byte, error) {
 	if data, ok := c.Get(msgID, chunkIdx); ok {
 		return data, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	key := chunkKey{msgID: msgID, chunkIdx: chunkIdx}
 	c.flightMu.Lock()
-	if call, ok := c.inflight[key]; ok {
-		c.flightMu.Unlock()
-		<-call.done
+	call, ok := c.inflight[key]
+	if !ok {
+		call = &flightCall{done: make(chan struct{})}
+		c.inflight[key] = call
+		go func() {
+			data, err := fetch()
+			if err == nil && len(data) > 0 {
+				c.Put(msgID, chunkIdx, data)
+			}
+			call.data = data
+			call.err = err
+			close(call.done)
+
+			c.flightMu.Lock()
+			delete(c.inflight, key)
+			c.flightMu.Unlock()
+		}()
+	}
+	c.flightMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-call.done:
 		return call.data, call.err
 	}
-	call := &flightCall{done: make(chan struct{})}
-	c.inflight[key] = call
-	c.flightMu.Unlock()
-
-	data, err := fetch()
-	if err == nil && len(data) > 0 {
-		c.Put(msgID, chunkIdx, data)
-	}
-
-	call.data = data
-	call.err = err
-	close(call.done)
-
-	c.flightMu.Lock()
-	delete(c.inflight, key)
-	c.flightMu.Unlock()
-
-	return data, err
 }
 
 func (c *ChunkCache) SetMaxBytes(maxBytes int64) {
@@ -187,9 +198,10 @@ func (c *ChunkCache) evictLocked() {
 		if el == nil {
 			break
 		}
-		ent := el.Value.(*cacheEntry)
 		c.ll.Remove(el)
-		delete(c.items, ent.key)
-		c.used -= int64(len(ent.data))
+		if ent, ok := el.Value.(*cacheEntry); ok {
+			delete(c.items, ent.key)
+			c.used -= int64(len(ent.data))
+		}
 	}
 }
